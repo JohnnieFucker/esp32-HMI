@@ -1,5 +1,6 @@
 set(UI_DIR "./eez_ui")
 file(GLOB_RECURSE UI_SRCS ${UI_DIR}/*.c ${UI_DIR}/*.cpp) 
+
 idf_component_register(
                          SRCS 
                               "./main.cpp" 
@@ -37,6 +38,18 @@ idf_component_register(
                               "./Wireless"
                               ${UI_DIR}
                               "."
+                         
+                         REQUIRES 
+                              lvgl
+                              esp_timer
+                              esp_lcd
+                              fatfs
+                              spi_flash
+                              nvs_flash
+                              esp_adc
+                              esp_wifi
+                              bt
+                              espressif__esp-sr
                        )
 
 # Force include our compatibility header first for all C++ files

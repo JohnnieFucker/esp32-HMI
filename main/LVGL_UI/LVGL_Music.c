@@ -5,6 +5,14 @@
 /*********************
  *      DEFINES
  *********************/
+#ifndef LV_DEMO_MUSIC_LARGE
+#define LV_DEMO_MUSIC_LARGE 0
+#endif
+#if LV_DEMO_MUSIC_LARGE
+#define LV_DEMO_MUSIC_HANDLE_SIZE  40
+#else
+#define LV_DEMO_MUSIC_HANDLE_SIZE  20
+#endif
 #define INTRO_TIME          2000
 #define BAR_COLOR1          lv_color_hex(0xe9dbfc)
 #define BAR_COLOR2          lv_color_hex(0x6f8af6)
@@ -92,10 +100,20 @@ lv_obj_t * _lv_demo_music_main_create(lv_obj_t * parent)
   LVGL_Search_Music();   
   if(ACTIVE_TRACK_CNT) {                                  
     lv_style_init(&music_style);
+    
+    #if LV_FONT_MONTSERRAT_12
+        font_small = &lv_font_montserrat_12;
+    #else
+        font_small = LV_FONT_DEFAULT;
+    #endif
+    
+    #if LV_FONT_MONTSERRAT_16
+        font_large = &lv_font_montserrat_16;
+    #else
+        font_large = LV_FONT_DEFAULT;
+    #endif
+    
     lv_style_set_text_font(&music_style, font_large);
-
-    font_small = &lv_font_montserrat_12;
-    font_large = &lv_font_montserrat_16;
 
   // 1
     panel1 = lv_obj_create(parent);

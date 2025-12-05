@@ -9,7 +9,6 @@ extern "C" {
 #include "esp_check.h"
 #include "esp_log.h"
 #include "freertos/semphr.h"
-#include "unity.h"
 
 #include "SD_MMC.h"
 

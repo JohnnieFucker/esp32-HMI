@@ -223,8 +223,8 @@ void Touch_Init(void)
     esp_lcd_panel_io_handle_t tp_io_handle = NULL;
     esp_lcd_panel_io_i2c_config_t tp_io_config = ESP_LCD_TOUCH_IO_I2C_CST816_CONFIG();
     ESP_LOGI(TAG, "Initialize touch IO (I2C)");
-    /* Touch IO handle */
-    ESP_ERROR_CHECK(esp_lcd_new_panel_io_i2c((esp_lcd_i2c_bus_handle_t)I2C_Touch_MASTER_NUM, &tp_io_config, &tp_io_handle));
+    /* Touch IO handle - use v1 function directly to avoid C++ overload conflict */
+    ESP_ERROR_CHECK(esp_lcd_new_panel_io_i2c_v1((uint32_t)I2C_Touch_MASTER_NUM, &tp_io_config, &tp_io_handle));
     esp_lcd_touch_config_t tp_cfg = {
         .x_max = EXAMPLE_LCD_WIDTH,
         .y_max = EXAMPLE_LCD_HEIGHT,

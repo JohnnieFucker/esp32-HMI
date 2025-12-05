@@ -1,6 +1,8 @@
+set(UI_DIR "./eez_ui")
+file(GLOB_RECURSE UI_SRCS ${UI_DIR}/*.c ${UI_DIR}/*.cpp) 
 idf_component_register(
                          SRCS 
-                              "./main.c" 
+                              "./main.cpp" 
                               "./EXIO/TCA9554PWR.c"
                               "./Audio_Driver/PCM5101.c" 
                               "./MIC_Driver/MIC_Speech.c" 
@@ -16,12 +18,13 @@ idf_component_register(
                               "./PCF85063/PCF85063.c"
                               "./BAT_Driver/BAT_Driver.c"
                               "./Wireless/Wireless.c"
+                              ${UI_SRCS}
 
                          INCLUDE_DIRS 
+                              "./LCD_Driver"  # Put LCD_Driver first to ensure our esp_lcd_io_i2c.h is used
                               "./Audio_Driver" 
                               "./MIC_Driver" 
                               "./LCD_Driver/esp_lcd_st77916" 
-                              "./LCD_Driver" 
                               "./Touch_Driver/esp_lcd_touch"     
                               "./Touch_Driver"
                               "./LVGL_Driver" 
@@ -32,5 +35,12 @@ idf_component_register(
                               "./PCF85063"
                               "./BAT_Driver"
                               "./Wireless"
+                              ${UI_DIR}
                               "."
                        )
+
+# Force include our compatibility header first for all C++ files
+# This ensures our version is always included before ESP-IDF's version
+target_compile_options(${COMPONENT_LIB} PRIVATE 
+    "$<$<COMPILE_LANGUAGE:CXX>:-include${CMAKE_CURRENT_SOURCE_DIR}/LCD_Driver/esp_lcd_io_i2c.h>"
+)

@@ -13,6 +13,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "lvgl.h"  // 确保包含LVGL主头文件，spinner会自动包含
+#include <string.h>
 
 objects_t objects;
 lv_obj_t *tick_value_change_obj;
@@ -205,8 +206,53 @@ static void event_handler_cb_page_conf_btn_notes_start_1(lv_event_t *e) {
     }
 }
 
-void create_screen_main() {
+void create_screen_loading() {
     void *flowState = getFlowState(0, 0);
+    (void)flowState;
+    lv_obj_t *obj = lv_obj_create(0);
+    objects.loading = obj;
+    lv_obj_set_pos(obj, 0, 0);
+    lv_obj_set_size(obj, 360, 360);
+    lv_obj_set_style_arc_color(obj, lv_color_hex(0xffc02537), LV_PART_SCROLLBAR | LV_STATE_DEFAULT);
+    {
+        lv_obj_t *parent_obj = obj;
+        {
+            lv_obj_t *obj = lv_spinner_create(parent_obj, 1000, 60);
+            objects.obj1 = obj;
+            lv_obj_set_pos(obj, 130, 130);
+            lv_obj_set_size(obj, 100, 100);
+            lv_obj_set_style_arc_color(obj, lv_color_hex(0xffc02537), LV_PART_INDICATOR | LV_STATE_DEFAULT);
+        }
+        {
+            // lab_loading
+            lv_obj_t *obj = lv_label_create(parent_obj);
+            objects.lab_loading = obj;
+            lv_obj_set_pos(obj, 55, 65);
+            lv_obj_set_size(obj, 250, 50);
+            lv_obj_set_style_text_font(obj, &ui_font_chinese_18, LV_PART_MAIN | LV_STATE_DEFAULT);
+            lv_obj_set_style_text_align(obj, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN | LV_STATE_DEFAULT);
+            lv_label_set_text(obj, "连接中");
+        }
+    }
+    
+    tick_screen_loading();
+}
+
+void delete_screen_loading() {
+    lv_obj_del(objects.loading);
+    objects.loading = 0;
+    objects.obj1 = 0;
+    objects.lab_loading = 0;
+    deletePageFlowState(0);
+}
+
+void tick_screen_loading() {
+    void *flowState = getFlowState(0, 0);
+    (void)flowState;
+}
+
+void create_screen_main() {
+    void *flowState = getFlowState(0, 1);
     (void)flowState;
     lv_obj_t *obj = lv_obj_create(0);
     objects.main = obj;
@@ -266,16 +312,16 @@ void delete_screen_main() {
     objects.main = 0;
     objects.btn_notes = 0;
     objects.obj0 = 0;
-    deletePageFlowState(0);
+    deletePageFlowState(1);
 }
 
 void tick_screen_main() {
-    void *flowState = getFlowState(0, 0);
+    void *flowState = getFlowState(0, 1);
     (void)flowState;
 }
 
 void create_screen_page_notes() {
-    void *flowState = getFlowState(0, 1);
+    void *flowState = getFlowState(0, 2);
     (void)flowState;
     lv_obj_t *obj = lv_obj_create(0);
     objects.page_notes = obj;
@@ -339,16 +385,16 @@ void delete_screen_page_notes() {
     objects.page_notes = 0;
     objects.btn_notes_start = 0;
     objects.btn_notes_end = 0;
-    deletePageFlowState(1);
+    deletePageFlowState(2);
 }
 
 void tick_screen_page_notes() {
-    void *flowState = getFlowState(0, 1);
+    void *flowState = getFlowState(0, 2);
     (void)flowState;
 }
 
 void create_screen_page_conf() {
-    void *flowState = getFlowState(0, 2);
+    void *flowState = getFlowState(0, 3);
     (void)flowState;
     lv_obj_t *obj = lv_obj_create(0);
     objects.page_conf = obj;
@@ -371,7 +417,7 @@ void create_screen_page_conf() {
                 lv_obj_t *parent_obj = obj;
                 {
                     lv_obj_t *obj = lv_label_create(parent_obj);
-                    objects.obj1 = obj;
+                    objects.obj2 = obj;
                     lv_obj_set_pos(obj, 0, 0);
                     lv_obj_set_size(obj, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
                     lv_obj_set_style_align(obj, LV_ALIGN_CENTER, LV_PART_MAIN | LV_STATE_DEFAULT);
@@ -389,142 +435,28 @@ void delete_screen_page_conf() {
     lv_obj_del(objects.page_conf);
     objects.page_conf = 0;
     objects.btn_notes_start_1 = 0;
-    objects.obj1 = 0;
-    deletePageFlowState(2);
+    objects.obj2 = 0;
+    deletePageFlowState(3);
 }
 
 void tick_screen_page_conf() {
-    void *flowState = getFlowState(0, 2);
+    void *flowState = getFlowState(0, 3);
     (void)flowState;
     {
         const char *new_val = evalTextProperty(flowState, 2, 3, "Failed to evaluate Text in Label widget");
-        const char *cur_val = lv_label_get_text(objects.obj1);
+        const char *cur_val = lv_label_get_text(objects.obj2);
         if (strcmp(new_val, cur_val) != 0) {
-            tick_value_change_obj = objects.obj1;
-            lv_label_set_text(objects.obj1, new_val);
+            tick_value_change_obj = objects.obj2;
+            lv_label_set_text(objects.obj2, new_val);
             tick_value_change_obj = NULL;
         }
     }
 }
 
 
-static const char *screen_names[] = { "Loading", "Main", "page_notes", "page_conf", "Error" };
-static const char *object_names[] = { "main", "page_notes", "page_conf", "screen_loading", "screen_error", "btn_notes", "obj0", "btn_notes_start", "btn_notes_end", "btn_notes_start_1", "obj1", "loading_spinner", "loading_label", "error_label" };
+static const char *screen_names[] = { "loading", "Main", "page_notes", "page_conf" };
+static const char *object_names[] = { "loading", "main", "page_notes", "page_conf", "btn_notes", "obj0", "btn_notes_start", "btn_notes_end", "btn_notes_start_1", "obj1", "lab_loading", "obj2" };
 
-
-// 加载界面
-void create_screen_loading() {
-    lv_obj_t *obj = lv_obj_create(NULL);  // 使用NULL而不是0，更清晰
-    objects.screen_loading = obj;
-    if (obj == NULL) {
-        ESP_LOGE("SCREENS", "创建loading屏幕失败！");
-        return;
-    }
-    lv_obj_set_pos(obj, 0, 0);
-    lv_obj_set_size(obj, 360, 360);
-    lv_obj_set_style_bg_color(obj, lv_color_hex(0x000000), LV_PART_MAIN | LV_STATE_DEFAULT);
-    // 禁用滚动
-    lv_obj_clear_flag(obj, LV_OBJ_FLAG_SCROLLABLE);
-    ESP_LOGI("SCREENS", "Loading屏幕创建成功");
-    
-    {
-        lv_obj_t *parent_obj = obj;
-        // 创建加载动画（spinner）- 如果spinner不可用，使用简单的arc
-        #if LV_USE_SPINNER
-        objects.loading_spinner = lv_spinner_create(parent_obj, 1000, 60);
-        if (objects.loading_spinner) {
-            lv_obj_set_size(objects.loading_spinner, 80, 80);
-            lv_obj_center(objects.loading_spinner);
-            lv_obj_set_style_arc_color(objects.loading_spinner, lv_color_hex(0x2196f3), LV_PART_MAIN | LV_STATE_DEFAULT);
-            lv_obj_set_style_arc_color(objects.loading_spinner, lv_color_hex(0x808080), LV_PART_INDICATOR | LV_STATE_DEFAULT);
-        }
-        #else
-        // 如果spinner不可用，创建一个简单的圆形作为占位符
-        objects.loading_spinner = lv_obj_create(parent_obj);
-        if (objects.loading_spinner) {
-            lv_obj_set_size(objects.loading_spinner, 80, 80);
-            lv_obj_center(objects.loading_spinner);
-            lv_obj_set_style_radius(objects.loading_spinner, LV_RADIUS_CIRCLE, LV_PART_MAIN | LV_STATE_DEFAULT);
-            lv_obj_set_style_bg_color(objects.loading_spinner, lv_color_hex(0x2196f3), LV_PART_MAIN | LV_STATE_DEFAULT);
-            lv_obj_set_style_border_width(objects.loading_spinner, 0, LV_PART_MAIN | LV_STATE_DEFAULT);
-        }
-        #endif
-        
-        // 创建加载文字
-        objects.loading_label = lv_label_create(parent_obj);
-        lv_obj_set_pos(objects.loading_label, 0, 0);
-        lv_obj_set_size(objects.loading_label, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
-        lv_obj_set_style_align(objects.loading_label, LV_ALIGN_CENTER, LV_PART_MAIN | LV_STATE_DEFAULT);
-        lv_obj_align(objects.loading_label, LV_ALIGN_CENTER, 0, 60);
-        lv_obj_set_style_text_color(objects.loading_label, lv_color_hex(0xFFFFFF), LV_PART_MAIN | LV_STATE_DEFAULT);
-        lv_obj_set_style_text_font(objects.loading_label, &ui_font_chinese_18, LV_PART_MAIN | LV_STATE_DEFAULT);
-        lv_label_set_text(objects.loading_label, "正在连接网络...");
-    }
-    
-    tick_screen_loading();
-}
-
-void delete_screen_loading() {
-    if (objects.screen_loading) {
-        lv_obj_del(objects.screen_loading);
-        objects.screen_loading = 0;
-        objects.loading_spinner = 0;
-        objects.loading_label = 0;
-    }
-}
-
-void tick_screen_loading() {
-    // 可以在这里更新加载文字
-}
-
-// 错误界面
-void create_screen_error() {
-    lv_obj_t *obj = lv_obj_create(NULL);  // 使用NULL而不是0
-    objects.screen_error = obj;
-    if (obj == NULL) {
-        ESP_LOGE("SCREENS", "创建error屏幕失败！");
-        return;
-    }
-    lv_obj_set_pos(obj, 0, 0);
-    lv_obj_set_size(obj, 360, 360);
-    lv_obj_set_style_bg_color(obj, lv_color_hex(0x000000), LV_PART_MAIN | LV_STATE_DEFAULT);
-    // 禁用滚动
-    lv_obj_clear_flag(obj, LV_OBJ_FLAG_SCROLLABLE);
-    ESP_LOGI("SCREENS", "Error屏幕创建成功");
-    
-    {
-        lv_obj_t *parent_obj = obj;
-        // 创建错误文字
-        objects.error_label = lv_label_create(parent_obj);
-        lv_obj_set_pos(objects.error_label, 0, 0);
-        lv_obj_set_size(objects.error_label, 320, LV_SIZE_CONTENT);
-        lv_obj_set_style_align(objects.error_label, LV_ALIGN_CENTER, LV_PART_MAIN | LV_STATE_DEFAULT);
-        lv_obj_center(objects.error_label);
-        lv_obj_set_style_text_color(objects.error_label, lv_color_hex(0xFF0000), LV_PART_MAIN | LV_STATE_DEFAULT);
-        lv_obj_set_style_text_font(objects.error_label, &ui_font_chinese_18, LV_PART_MAIN | LV_STATE_DEFAULT);
-        lv_label_set_text(objects.error_label, "网络连接失败");
-        lv_label_set_long_mode(objects.error_label, LV_LABEL_LONG_WRAP);
-        lv_obj_set_style_text_align(objects.error_label, LV_TEXT_ALIGN_CENTER, LV_PART_MAIN | LV_STATE_DEFAULT);
-    }
-    
-    tick_screen_error();
-}
-
-void delete_screen_error() {
-    if (objects.screen_error) {
-        lv_obj_del(objects.screen_error);
-        objects.screen_error = 0;
-        objects.error_label = 0;
-    }
-}
-
-void tick_screen_error() {
-    // 更新错误信息
-    const char *error_msg = WiFi_GetError();
-    if (error_msg && objects.error_label) {
-        lv_label_set_text(objects.error_label, error_msg);
-    }
-}
 
 typedef void (*create_screen_func_t)();
 create_screen_func_t create_screen_funcs[] = {
@@ -532,24 +464,12 @@ create_screen_func_t create_screen_funcs[] = {
     create_screen_main,
     create_screen_page_notes,
     create_screen_page_conf,
-    create_screen_error,
 };
 void create_screen(int screen_index) {
     create_screen_funcs[screen_index]();
 }
 void create_screen_by_id(enum ScreensEnum screenId) {
-    // SCREEN_ID_LOADING = 0, 所以不需要减1
-    if (screenId == SCREEN_ID_LOADING) {
-        create_screen_funcs[0]();
-    } else if (screenId == SCREEN_ID_MAIN) {
-        create_screen_funcs[1]();
-    } else if (screenId == SCREEN_ID_PAGE_NOTES) {
-        create_screen_funcs[2]();
-    } else if (screenId == SCREEN_ID_PAGE_CONF) {
-        create_screen_funcs[3]();
-    } else if (screenId == SCREEN_ID_ERROR) {
-        create_screen_funcs[4]();
-    }
+    create_screen_funcs[screenId - 1]();
 }
 
 typedef void (*delete_screen_func_t)();
@@ -558,24 +478,12 @@ delete_screen_func_t delete_screen_funcs[] = {
     delete_screen_main,
     delete_screen_page_notes,
     delete_screen_page_conf,
-    delete_screen_error,
 };
 void delete_screen(int screen_index) {
     delete_screen_funcs[screen_index]();
 }
 void delete_screen_by_id(enum ScreensEnum screenId) {
-    // SCREEN_ID_LOADING = 0, 所以不需要减1
-    if (screenId == SCREEN_ID_LOADING) {
-        delete_screen_funcs[0]();
-    } else if (screenId == SCREEN_ID_MAIN) {
-        delete_screen_funcs[1]();
-    } else if (screenId == SCREEN_ID_PAGE_NOTES) {
-        delete_screen_funcs[2]();
-    } else if (screenId == SCREEN_ID_PAGE_CONF) {
-        delete_screen_funcs[3]();
-    } else if (screenId == SCREEN_ID_ERROR) {
-        delete_screen_funcs[4]();
-    }
+    delete_screen_funcs[screenId - 1]();
 }
 
 typedef void (*tick_screen_func_t)();
@@ -584,24 +492,12 @@ tick_screen_func_t tick_screen_funcs[] = {
     tick_screen_main,
     tick_screen_page_notes,
     tick_screen_page_conf,
-    tick_screen_error,
 };
 void tick_screen(int screen_index) {
     tick_screen_funcs[screen_index]();
 }
 void tick_screen_by_id(enum ScreensEnum screenId) {
-    // SCREEN_ID_LOADING = 0, 所以不需要减1
-    if (screenId == SCREEN_ID_LOADING) {
-        tick_screen_funcs[0]();
-    } else if (screenId == SCREEN_ID_MAIN) {
-        tick_screen_funcs[1]();
-    } else if (screenId == SCREEN_ID_PAGE_NOTES) {
-        tick_screen_funcs[2]();
-    } else if (screenId == SCREEN_ID_PAGE_CONF) {
-        tick_screen_funcs[3]();
-    } else if (screenId == SCREEN_ID_ERROR) {
-        tick_screen_funcs[4]();
-    }
+    tick_screen_funcs[screenId - 1]();
 }
 
 void create_screens() {
@@ -615,9 +511,7 @@ void create_screens() {
     lv_theme_t *theme = lv_theme_default_init(dispp, lv_palette_main(LV_PALETTE_BLUE), lv_palette_main(LV_PALETTE_RED), true, LV_FONT_DEFAULT);
     lv_disp_set_theme(dispp, theme);
     
-    // 先创建所有界面
     create_screen_loading();
-    create_screen_error();
     create_screen_main();
     create_screen_page_notes();
     create_screen_page_conf();

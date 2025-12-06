@@ -12,9 +12,6 @@
 #include "driver/gpio.h"
 #include "esp_check.h"
 #include "esp_lcd_panel_interface.h"
-// Include ESP-LCD headers
-// Our wrapper esp_lcd_panel_io.h automatically includes our compatibility
-// version of esp_lcd_io_i2c.h instead of ESP-IDF's conflicting version
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_vendor.h"
 #include "esp_lcd_panel_ops.h"

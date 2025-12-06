@@ -173,12 +173,28 @@ static void record_task(void *pvParameters) {
         
         if (use_chunk_mode) {
             // ========== 分块录音模式 ==========
-            int samples_per_chunk = RECORD_SAMPLE_RATE * RECORD_CHUNK_DURATION_SEC;
+            // 动态调整分块大小
+            int chunk_duration = RECORD_CHUNK_DURATION_SEC;
+            
+            // 预检查内存，如果不够10秒（约320KB），则降级到5秒（约160KB）
+            size_t est_chunk_size = wav_header_size + (RECORD_SAMPLE_RATE * chunk_duration * bytes_per_sample);
+            size_t current_free_spiram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+            size_t current_free_internal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+            
+            if (est_chunk_size > current_free_spiram && est_chunk_size > current_free_internal) {
+                if (chunk_duration > 5) {
+                    chunk_duration = 5;
+                    ESP_LOGW(TAG, "可用内存不足以支持 %d 秒分块，自动降级为 %d 秒", RECORD_CHUNK_DURATION_SEC, chunk_duration);
+                }
+            }
+
+            int samples_per_chunk = RECORD_SAMPLE_RATE * chunk_duration;
             size_t chunk_audio_size = samples_per_chunk * bytes_per_sample;
             size_t chunk_buffer_size = wav_header_size + chunk_audio_size;
-            int total_chunks = (RECORD_DURATION_SEC + RECORD_CHUNK_DURATION_SEC - 1) / RECORD_CHUNK_DURATION_SEC;
+            int total_chunks = (RECORD_DURATION_SEC + chunk_duration - 1) / chunk_duration;
             
-            ESP_LOGI(TAG, "开始分块录音: note_box_%s_%s_%d.wav，共 %d 块", USER_ID, g_current_uuid, g_file_counter, total_chunks);
+            ESP_LOGI(TAG, "开始分块录音: note_box_%s_%s_%d.wav，共 %d 块 (每块%d秒)", 
+                     USER_ID, g_current_uuid, g_file_counter, total_chunks, chunk_duration);
             
             // 构建上传URL
             char url[512];
@@ -224,7 +240,7 @@ static void record_task(void *pvParameters) {
                 
                 // 等待录音完成（定期检查停止标志）
                 int wait_count = 0;
-                int max_wait_count = (RECORD_CHUNK_DURATION_SEC * 1000 + 500) / 100;
+                int max_wait_count = (chunk_duration * 1000 + 500) / 100;
                 while (wait_count < max_wait_count && g_record_task_running && audio_recorder_is_recording()) {
                     vTaskDelay(pdMS_TO_TICKS(100));
                     wait_count++;
@@ -585,4 +601,3 @@ int generate_note(const char *note_id, const char *device, bool is_voice, int ty
 bool is_recording(void) {
     return g_record_task_running;
 }
-

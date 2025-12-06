@@ -1,4 +1,5 @@
 #include "LVGL_Driver.h"
+#include "esp_heap_caps.h"
 
 static const char *TAG_LVGL = "LVGL";
 
@@ -87,23 +88,66 @@ void LVGL_Init(void)
     ESP_LOGI(TAG_LVGL, "Initialize LVGL library");
     lv_init();
     
+    // 打印详细的内存状态
     size_t free_spiram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
-    ESP_LOGI(TAG_LVGL, "Free SPIRAM: %d bytes", free_spiram);
+    size_t free_internal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    size_t total_spiram = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
+    
+    ESP_LOGI(TAG_LVGL, "========== 内存状态 ==========");
+    ESP_LOGI(TAG_LVGL, "PSRAM 总容量: %d KB (%d MB)", total_spiram / 1024, total_spiram / 1024 / 1024);
+    ESP_LOGI(TAG_LVGL, "PSRAM 空闲: %d KB", free_spiram / 1024);
+    ESP_LOGI(TAG_LVGL, "Internal RAM 空闲: %d KB", free_internal / 1024);
+    ESP_LOGI(TAG_LVGL, "==============================");
+    
+    // 计算显存大小
+    size_t buf_size = LVGL_BUF_LEN * sizeof(lv_color_t);
+    ESP_LOGI(TAG_LVGL, "显存缓冲区大小: %d KB x 2 = %d KB", buf_size / 1024, buf_size * 2 / 1024);
 
-    lv_color_t *buf1 = heap_caps_malloc(LVGL_BUF_LEN * sizeof(lv_color_t), MALLOC_CAP_SPIRAM);
+    // 优先从 PSRAM 分配显存
+    lv_color_t *buf1 = NULL;
+    lv_color_t *buf2 = NULL;
+    
+    if (free_spiram >= buf_size * 2) {
+        buf1 = heap_caps_malloc(buf_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (buf1) {
+            ESP_LOGI(TAG_LVGL, "显存缓冲区1 从 PSRAM 分配成功");
+        }
+        buf2 = heap_caps_malloc(buf_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        if (buf2) {
+            ESP_LOGI(TAG_LVGL, "显存缓冲区2 从 PSRAM 分配成功");
+        }
+    }
+    
+    // 如果 PSRAM 分配失败，回退到 Internal RAM
     if (!buf1) {
-        ESP_LOGE(TAG_LVGL, "Failed to allocate display buffer 1 in SPIRAM! Trying Internal RAM...");
-        buf1 = heap_caps_malloc(LVGL_BUF_LEN * sizeof(lv_color_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+        ESP_LOGW(TAG_LVGL, "PSRAM 分配失败，尝试 Internal RAM...");
+        buf1 = heap_caps_malloc(buf_size, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+        if (buf1) {
+            ESP_LOGW(TAG_LVGL, "显存缓冲区1 从 Internal RAM 分配成功");
+        }
+    }
+    if (!buf2) {
+        ESP_LOGW(TAG_LVGL, "PSRAM 分配失败，尝试 Internal RAM...");
+        buf2 = heap_caps_malloc(buf_size, MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+        if (buf2) {
+            ESP_LOGW(TAG_LVGL, "显存缓冲区2 从 Internal RAM 分配成功");
+        }
+    }
+    
+    if (!buf1 || !buf2) {
+        ESP_LOGE(TAG_LVGL, "无法分配显存缓冲区！");
+        ESP_LOGE(TAG_LVGL, "请检查: 1. PSRAM 是否正确配置 2. 内存是否足够");
     }
     assert(buf1);
-    
-    lv_color_t *buf2 = heap_caps_malloc(LVGL_BUF_LEN * sizeof(lv_color_t) , MALLOC_CAP_SPIRAM);    
-    if (!buf2) {
-        ESP_LOGE(TAG_LVGL, "Failed to allocate display buffer 2 in SPIRAM! Trying Internal RAM...");
-        buf2 = heap_caps_malloc(LVGL_BUF_LEN * sizeof(lv_color_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
-    }
     assert(buf2);
+    
     lv_disp_draw_buf_init(&disp_buf, buf1, buf2, LVGL_BUF_LEN);                              // initialize LVGL draw buffers
+
+    // 打印分配后的内存状态
+    size_t free_spiram_after = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    size_t free_internal_after = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    ESP_LOGI(TAG_LVGL, "分配后 - PSRAM 空闲: %d KB, Internal RAM 空闲: %d KB", 
+             free_spiram_after / 1024, free_internal_after / 1024);
 
     ESP_LOGI(TAG_LVGL, "Register display driver to LVGL");
     lv_disp_drv_init(&disp_drv);                                                                        // Create a new screen object and initialize the associated device

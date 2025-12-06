@@ -25,15 +25,16 @@ static const wifi_config_item_t wifi_configs[WIFI_CONFIG_COUNT] = {
 #define WIFI_CONNECT_TIMEOUT_SEC 10
 
 // ==================== 录音配置 ====================
-// 录音时长（秒）
-#define RECORD_DURATION_SEC 30
+// 录音时长（秒）- 每次录音的总时长
+#define RECORD_DURATION_SEC 60
 
 // 是否启用分块录音模式（当内存不足时自动启用）
 // 分块模式：将长录音分成多个小块，每块录音后立即上传，减少内存占用
 #define RECORD_ENABLE_CHUNK_MODE 1 // 1=启用（自动检测内存），0=禁用
 
 // 分块录音的每块时长（秒），仅在分块模式下有效
-#define RECORD_CHUNK_DURATION_SEC 5
+// 启用 PSRAM 后，可以设置更长的分块时长
+#define RECORD_CHUNK_DURATION_SEC 60
 
 // ==================== 其他配置 ====================
 // 可以在此处添加其他模块的配置参数

@@ -11,6 +11,8 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include <string.h>
+#include <stdio.h>
 
 // ASSETS DEFINITION
 const uint8_t assets[2832] = {
@@ -203,94 +205,106 @@ ActionExecFunc actions[] = {
 };
 
 
-#if defined(EEZ_FOR_LVGL)
 
-void ui_init() {
-    eez_flow_init(assets, sizeof(assets), (lv_obj_t **)&objects, sizeof(objects), images, sizeof(images), actions);
-}
-
-void ui_tick() {
-    eez_flow_tick();
-    tick_screen(g_currentScreen);
-}
-
-#else
-
-static int16_t currentScreen = -1;
-
-static lv_obj_t *getLvglObjectFromIndex(int32_t index) {
-    if (index == -1) {
-        return 0;
-    }
-    // 根据索引获取对应的屏幕对象,lvgl对象
-    switch (index) {
-        case 0: return objects.loading;  // 修正：应该是 loading 而不是 screen_loading
-        case 1: return objects.main;
-        case 2: return objects.page_notes;
-        case 3: return objects.page_conf;
-        default: return 0;
-    }
-}
-static enum ScreensEnum current_screen_id = SCREEN_ID_LOADING;
 static bool wifi_check_started = false;
 static int wifi_check_timeout = 0;
 #define WIFI_CHECK_TIMEOUT_SEC 30 // WiFi检查超时时间（秒）
-
-void loadScreen(enum ScreensEnum screenId) {
-    // 修正屏幕ID到索引的映射关系
-    // SCREEN_ID_LOADING (1) -> index 0
-    // SCREEN_ID_MAIN (2) -> index 1
-    // SCREEN_ID_PAGE_NOTES (3) -> index 2
-    // SCREEN_ID_PAGE_CONF (4) -> index 3
-    if (screenId == SCREEN_ID_LOADING) {
-        currentScreen = 0;
-    } else if (screenId == SCREEN_ID_MAIN) {
-        currentScreen = 1;  // 修正：Main应该映射到索引1
-    } else if (screenId == SCREEN_ID_PAGE_NOTES) {
-        currentScreen = 2;  // 修正：page_notes应该映射到索引2
-    } else if (screenId == SCREEN_ID_PAGE_CONF) {
-        currentScreen = 3;  // 修正：page_conf应该映射到索引3
-    } else {
-        currentScreen = -1;  // 未知屏幕ID
-    }
-    current_screen_id = screenId;
-    lv_obj_t *screen = getLvglObjectFromIndex(currentScreen);
-    if (screen) {
-        // 直接加载屏幕，不使用动画，确保立即显示
-        lv_scr_load(screen);
-        ESP_LOGI("UI", "切换到屏幕 %d 成功", screenId);
-    } else {
-        ESP_LOGE("UI", "无法加载屏幕 %d，屏幕对象为空 (索引: %d)", screenId, currentScreen);
-    }
-}
+static bool screen_switch_pending = false;  // 标记屏幕切换是否待处理
+static int screen_switch_verify_count = 0;  // 屏幕切换验证计数
 
 void ui_init() {
-    create_screens();
-    loadScreen(SCREEN_ID_LOADING);
+    // 计算objects结构体中对象的数量（所有lv_obj_t*成员的数量）
+    // objects_t结构体包含: loading, main, page_notes, page_conf, btn_notes, obj0, 
+    // btn_notes_start, btn_notes_end, btn_notes_start_1, obj1, lab_loading, obj2
+    // 共12个对象
+    const size_t num_objects = sizeof(objects) / sizeof(lv_obj_t *);
+    ESP_LOGI("UI", "初始化UI，对象数量: %zu", num_objects);
+    eez_flow_init(assets, sizeof(assets), (lv_obj_t **)&objects, num_objects, images, sizeof(images), actions);
     wifi_check_started = true;
     wifi_check_timeout = 0;
 }
 
 void ui_tick() {
-// 如果正在显示加载界面，检查WiFi状态
+    eez_flow_tick();
+    
+    // 如果屏幕切换待处理，验证切换是否成功
+    if (screen_switch_pending) {
+        screen_switch_verify_count++;
+        int16_t current_screen_id = eez_flow_get_current_screen();
+        if (current_screen_id == SCREEN_ID_MAIN) {
+            ESP_LOGI("UI", "屏幕切换成功！当前屏幕ID: %d (验证次数: %d)", current_screen_id, screen_switch_verify_count);
+            screen_switch_pending = false;
+            screen_switch_verify_count = 0;
+        } else if (screen_switch_verify_count > 20) {  // 最多验证20次（约100ms）
+            ESP_LOGW("UI", "屏幕切换验证超时，当前屏幕ID: %d (期望: %d)", current_screen_id, SCREEN_ID_MAIN);
+            screen_switch_pending = false;
+            screen_switch_verify_count = 0;
+        }
+    }
+    
+    // 如果当前在加载界面，检查WiFi状态
+    int16_t current_screen_id = eez_flow_get_current_screen();
     if (current_screen_id == SCREEN_ID_LOADING && wifi_check_started) {
         wifi_check_timeout++;
         
         // 检查WiFi连接状态
         bool wifi_connected = WiFi_IsConnected();
+        const char *error_msg = WiFi_GetError();
+        
+        // // 更新 lab_loading 标签显示调试信息
+        // if (objects.lab_loading != NULL) {
+        //     static char debug_text[256];
+        //     int elapsed_sec = wifi_check_timeout / 200;  // ui_tick每5ms调用一次
+        //     snprintf(debug_text, sizeof(debug_text), 
+        //         "WiFi状态检查\n"
+        //         "超时计数: %d (%d秒)\n"
+        //         "连接状态: %s\n"
+        //         "错误信息: %s\n"
+        //         "当前屏幕ID: %d",
+        //         wifi_check_timeout, elapsed_sec,
+        //         wifi_connected ? "已连接" : "未连接",
+        //         error_msg ? error_msg : "无",
+        //         current_screen_id);
+        //     lv_label_set_text(objects.lab_loading, debug_text);
+        // }
         
         if (wifi_connected) {
             // WiFi连接成功，切换到主界面
-            loadScreen(SCREEN_ID_MAIN);
+            ESP_LOGI("UI", "WiFi连接成功，切换到主界面 (当前屏幕ID: %d)", current_screen_id);
+            if (objects.lab_loading != NULL) {
+                lv_label_set_text(objects.lab_loading, "WiFi已连接！\n正在切换到主界面...");
+            }
+            // 停止WiFi检查，避免重复切换
             wifi_check_started = false;
-        } else if (wifi_check_timeout >= WIFI_CHECK_TIMEOUT_SEC * 100) {
-            // 超时（30秒），显示错误界面
-            const char *error_msg = WiFi_GetError();
             
+            // 验证主界面对象是否存在
+            if (objects.main == NULL) {
+                ESP_LOGW("UI", "主界面对象未创建，尝试创建...");
+                // 主界面应该已经在 create_screens() 中创建，这里不应该发生
+            }
+            
+            // 使用 eez_flow_set_screen 切换屏幕（屏幕ID是1-based）
+            ESP_LOGI("UI", "准备切换屏幕: 从 %d 到 %d", current_screen_id, SCREEN_ID_MAIN);
+            ESP_LOGI("UI", "主界面对象指针: %p", (void*)objects.main);
+            
+            eez_flow_set_screen(SCREEN_ID_MAIN, LV_SCR_LOAD_ANIM_NONE, 0, 0);
+            
+            // 标记屏幕切换待处理，下一帧开始验证
+            screen_switch_pending = true;
+            screen_switch_verify_count = 0;
+            
+            ESP_LOGI("UI", "已调用屏幕切换函数，目标屏幕ID: %d", SCREEN_ID_MAIN);
+        } else if (wifi_check_timeout >= WIFI_CHECK_TIMEOUT_SEC * 200) {  // 5ms * 200 = 1秒
+            // 超时（30秒），显示错误信息
+            ESP_LOGE("UI", "WiFi连接超时: %s", error_msg ? error_msg : "未知错误");
+            if (objects.lab_loading != NULL && error_msg != NULL) {
+                static char timeout_text[128];
+                snprintf(timeout_text, sizeof(timeout_text), "%s", error_msg);
+                lv_label_set_text(objects.lab_loading, timeout_text);
+            }
             wifi_check_started = false;
         }
     }
-    tick_screen(currentScreen);
+    
+    tick_screen(g_currentScreen);
 }
-
-#endif

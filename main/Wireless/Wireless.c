@@ -351,16 +351,10 @@ bool WiFi_IsConnected(void) {
         return false;  // 初始化未完成，返回未连接
     }
     
-    // 检查WiFi状态
-    wifi_ap_record_t ap_info;
-    esp_err_t ret = esp_wifi_sta_get_ap_info(&ap_info);
-    if (ret == ESP_OK) {
-        wifi_connected = true;
-        return true;
-    } else {
-        wifi_connected = false;
-        return false;
-    }
+    // 直接使用事件处理函数中设置的 wifi_connected 变量
+    // 这个变量在 IP_EVENT_STA_GOT_IP 事件中设置为 true
+    // 在 WIFI_EVENT_STA_DISCONNECTED 事件中设置为 false
+    return wifi_connected;
 }
 
 // 获取WiFi错误信息

@@ -361,9 +361,13 @@ esp_err_t http_client_post_multipart_streaming(const http_request_config_t *conf
     esp_http_client_config_t client_config = {0};
     client_config.url = config->url;
     client_config.method = HTTP_METHOD_POST;
-    client_config.timeout_ms = config->timeout_ms > 0 ? config->timeout_ms : 30000;
+    // 大文件上传需要更长的超时时间（默认120秒，约2分钟）
+    client_config.timeout_ms = config->timeout_ms > 0 ? config->timeout_ms : 120000;
     client_config.event_handler = config->response_cb ? http_event_handler : NULL;
     client_config.user_data = (void *)config;
+    // 设置HTTP头部缓冲区大小，防止 "Buffer length is small to fit all the headers" 错误
+    client_config.buffer_size = 4096;          // 接收缓冲区大小
+    client_config.buffer_size_tx = 4096;       // 发送缓冲区大小
 
     // HTTPS SSL/TLS 配置
     http_ssl_verify_mode_t verify_mode = config->ssl_verify_mode;
@@ -418,12 +422,14 @@ esp_err_t http_client_post_multipart_streaming(const http_request_config_t *conf
     esp_http_client_set_header(client, "Content-Length", content_length_str);
 
     // 打开连接
+    ESP_LOGI(TAG, "正在打开HTTP连接...");
     esp_err_t err = esp_http_client_open(client, total_body_size);
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "无法打开HTTP连接: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "无法打开HTTP连接: %s (0x%x)", esp_err_to_name(err), err);
         esp_http_client_cleanup(client);
         return err;
     }
+    ESP_LOGI(TAG, "HTTP连接已打开，开始发送数据...");
 
     // 流式写入multipart头部
     char body_start[512];
@@ -446,13 +452,15 @@ esp_err_t http_client_post_multipart_streaming(const http_request_config_t *conf
     const size_t chunk_size = 64 * 1024;  // 64KB块大小
     size_t remaining = file_data_size;
     const uint8_t *file_ptr = file_data;
+    size_t total_written = 0;
+    int chunk_count = 0;
     
     while (remaining > 0) {
         size_t to_write = (remaining > chunk_size) ? chunk_size : remaining;
         written = esp_http_client_write(client, (const char *)file_ptr, to_write);
         
         if (written < 0) {
-            ESP_LOGE(TAG, "写入文件数据失败: %d", written);
+            ESP_LOGE(TAG, "写入文件数据失败: %d (已发送 %zu/%zu 字节)", written, total_written, file_data_size);
             esp_http_client_close(client);
             esp_http_client_cleanup(client);
             return ESP_FAIL;
@@ -464,6 +472,15 @@ esp_err_t http_client_post_multipart_streaming(const http_request_config_t *conf
         
         file_ptr += written;
         remaining -= written;
+        total_written += written;
+        chunk_count++;
+        
+        // 每发送 256KB 打印一次进度
+        if (chunk_count % 4 == 0 || remaining == 0) {
+            ESP_LOGI(TAG, "上传进度: %zu/%zu KB (%.1f%%)", 
+                     total_written / 1024, file_data_size / 1024, 
+                     (float)total_written / file_data_size * 100);
+        }
     }
 
     // 流式写入multipart尾部
@@ -483,47 +500,73 @@ esp_err_t http_client_post_multipart_streaming(const http_request_config_t *conf
         esp_http_client_cleanup(client);
         return ESP_FAIL;
     }
+    
+    ESP_LOGI(TAG, "数据发送完成，等待服务器响应...");
 
     // 完成请求并读取响应
-    err = esp_http_client_fetch_headers(client);
-    if (err == ESP_OK) {
-        int code = esp_http_client_get_status_code(client);
-        int content_length = esp_http_client_get_content_length(client);
-        ESP_LOGI(TAG, "HTTP请求状态码 = %d, 内容长度 = %d", code, content_length);
+    // 注意：esp_http_client_fetch_headers 成功时返回 content_length（可能是 -1 表示 chunked）
+    // 失败时返回 ESP_FAIL (-1) 或其他负数错误码
+    int64_t fetch_result = esp_http_client_fetch_headers(client);
+    
+    // 先获取状态码来判断是否成功
+    int code = esp_http_client_get_status_code(client);
+    int content_length = esp_http_client_get_content_length(client);
+    
+    ESP_LOGI(TAG, "fetch_headers 返回: %lld, 状态码: %d, 内容长度: %d", fetch_result, code, content_length);
+    
+    // 如果状态码为0，说明可能连接失败
+    if (code == 0) {
+        ESP_LOGE(TAG, "HTTP请求失败: 状态码为0，可能是连接失败或超时");
+        
+        // 尝试获取更多信息
+        int transport_err = esp_http_client_get_errno(client);
+        if (transport_err != 0) {
+            ESP_LOGE(TAG, "底层传输层错误码: %d", transport_err);
+        }
+        
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
         
         if (status_code != NULL) {
-            *status_code = code;
+            *status_code = 0;
         }
+        return ESP_FAIL;
+    }
+    
+    // 有状态码，请求成功
+    ESP_LOGI(TAG, "HTTP请求成功，状态码 = %d, 内容长度 = %d", code, content_length);
+    
+    if (status_code != NULL) {
+        *status_code = code;
+    }
 
-        // 读取响应
-        if (response_buffer != NULL && response_buffer_size > 0 && !config->response_cb) {
-            if (content_length > 0) {
-                char *response = (char *)malloc(content_length + 1);
-                if (response != NULL) {
-                    int data_read = esp_http_client_read_response(client, response, content_length);
+    // 读取响应
+    if (response_buffer != NULL && response_buffer_size > 0 && !config->response_cb) {
+        if (content_length > 0) {
+            char *response = (char *)malloc(content_length + 1);
+            if (response != NULL) {
+                int data_read = esp_http_client_read_response(client, response, content_length);
+                if (data_read > 0) {
                     response[data_read] = '\0';
                     
-                    if (data_read < (int)response_buffer_size) {
-                        strncpy(response_buffer, response, response_buffer_size - 1);
-                        response_buffer[response_buffer_size - 1] = '\0';
-                    } else {
-                        strncpy(response_buffer, response, response_buffer_size - 1);
-                        response_buffer[response_buffer_size - 1] = '\0';
-                    }
+                    size_t copy_len = (data_read < (int)response_buffer_size - 1) ? data_read : response_buffer_size - 1;
+                    strncpy(response_buffer, response, copy_len);
+                    response_buffer[copy_len] = '\0';
                     
-                    free(response);
+                    ESP_LOGI(TAG, "响应内容: %s", response_buffer);
                 }
+                free(response);
             }
         }
-    } else {
-        ESP_LOGE(TAG, "HTTP请求失败: %s", esp_err_to_name(err));
     }
 
     esp_http_client_close(client);
     esp_http_client_cleanup(client);
     
     ESP_LOGI(TAG, "流式上传完成，内存占用仅multipart头部和尾部（约 %zu 字节）", body_start_size + body_end_size);
-    return err;
+    
+    // 返回值基于HTTP状态码
+    return (code >= 200 && code < 300) ? ESP_OK : ESP_FAIL;
 }
 
 esp_err_t http_client_request(const http_request_config_t *config,
@@ -575,10 +618,9 @@ esp_err_t http_client_request(const http_request_config_t *config,
     client_config.timeout_ms = config->timeout_ms > 0 ? config->timeout_ms : 30000;
     client_config.event_handler = config->response_cb ? http_event_handler : NULL;
     client_config.user_data = (void *)config;
-    
-    // 注意：HTTP头部缓冲区大小通过menuconfig配置项 CONFIG_ESP_HTTP_CLIENT_MAX_HTTP_HEADER_LEN 设置
-    // 默认值为512字节，对于包含长Token的请求可能不够
-    // 建议在 sdkconfig.defaults 中设置：CONFIG_ESP_HTTP_CLIENT_MAX_HTTP_HEADER_LEN=4096
+    // 设置HTTP头部缓冲区大小，防止 "Buffer length is small to fit all the headers" 错误
+    client_config.buffer_size = 4096;          // 接收缓冲区大小
+    client_config.buffer_size_tx = 4096;       // 发送缓冲区大小
     
     // HTTPS SSL/TLS 配置
     // 根据配置的验证模式设置相应的选项

@@ -1,4 +1,5 @@
 #include "AudioRecorder.h"
+#include "app_config.h"
 #include "esp_log.h"
 #include "driver/i2s_std.h"
 #include "freertos/FreeRTOS.h"
@@ -7,6 +8,11 @@
 #include <stdio.h>
 
 static const char *TAG = "AudioRecorder";
+
+// 麦克风增益（如果未定义，使用默认值）
+#ifndef MIC_GAIN
+#define MIC_GAIN 1
+#endif
 
 // 默认配置
 #define DEFAULT_SAMPLE_RATE 16000
@@ -161,8 +167,47 @@ static void record_with_callback_task(void *pvParameters) {
             int16_t *out_buffer = (int16_t *)buffer;
             int32_t *in_buffer = (int32_t *)buffer;
             int samples = bytes_read / sizeof(int32_t);
+            
+            // 转换32位到16位，并应用增益
+            // I2S读取的是32位数据，有效数据在高位，右移14位得到16位数据
+            // 然后乘以增益放大音量
+            int32_t max_val = 0;
+            int32_t min_val = 0;
+            int non_zero_count = 0;
+            int clip_count = 0;  // 削波计数
+            
             for (int i = 0; i < samples; i++) {
-                out_buffer[i] = (int16_t)(in_buffer[i] >> 14);
+                if (in_buffer[i] != 0) non_zero_count++;
+                if (in_buffer[i] > max_val) max_val = in_buffer[i];
+                if (in_buffer[i] < min_val) min_val = in_buffer[i];
+                
+                // 转换并应用增益
+                int32_t sample = (in_buffer[i] >> 14) * MIC_GAIN;
+                
+                // 防止溢出（削波保护）
+                if (sample > 32767) {
+                    sample = 32767;
+                    clip_count++;
+                } else if (sample < -32768) {
+                    sample = -32768;
+                    clip_count++;
+                }
+                
+                out_buffer[i] = (int16_t)sample;
+            }
+            
+            // 每50次打印一次数据统计（约5秒）
+            static int debug_counter = 0;
+            if (debug_counter++ % 50 == 0) {
+                int16_t out_max = 0, out_min = 0;
+                for (int i = 0; i < samples; i++) {
+                    if (out_buffer[i] > out_max) out_max = out_buffer[i];
+                    if (out_buffer[i] < out_min) out_min = out_buffer[i];
+                }
+                ESP_LOGI(TAG, "音频: 非零=%.0f%%, 原始[%d~%d], 输出[%d~%d], 增益=%dx%s", 
+                         (float)non_zero_count/samples*100, min_val, max_val, 
+                         out_min, out_max, MIC_GAIN,
+                         clip_count > 0 ? " (有削波!)" : "");
             }
             
             // 调用回调函数

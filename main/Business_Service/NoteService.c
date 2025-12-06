@@ -6,6 +6,7 @@
 #include "HttpClient.h"
 #include "Utils.h"
 #include "freertos/task.h"
+#include "freertos/queue.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -17,6 +18,13 @@ static const char *TAG = "NoteService";
 #define RECORD_CHANNELS 1
 #define RECORD_BITS_PER_SAMPLE 16
 
+// 上传队列项
+typedef struct {
+    uint8_t *wav_buffer;     // WAV数据缓冲区
+    size_t wav_size;         // WAV文件大小
+    char filename[128];      // 文件名
+} upload_item_t;
+
 // 录音数据缓冲区结构
 typedef struct {
     uint8_t *buffer;        // 音频数据缓冲区
@@ -27,7 +35,12 @@ typedef struct {
 
 // 录音任务句柄和运行标志
 static TaskHandle_t g_record_task_handle = NULL;
+static TaskHandle_t g_upload_task_handle = NULL;
 static bool g_record_task_running = false;
+
+// 上传队列
+static QueueHandle_t g_upload_queue = NULL;
+#define UPLOAD_QUEUE_SIZE 2  // 最多缓存2个待上传文件
 
 // 录音会话信息（在开始录音时初始化）
 static char g_current_uuid[64] = {0};
@@ -39,41 +52,31 @@ static bool audio_data_callback(const void *data, size_t size, void *user_data) 
     
     if (audio_buf == NULL) {
         ESP_LOGE(TAG, "回调函数：audio_buf 为 NULL");
-        return false;  // 停止录音
+        return false;
     }
     
-    // 检查全局停止标志（用户点击停止按钮）
+    // 检查全局停止标志
     if (!g_record_task_running) {
         ESP_LOGI(TAG, "回调函数：检测到停止标志，停止录音");
         audio_buf->recording = false;
-        return false;  // 停止录音
+        return false;
     }
     
     if (!audio_buf->recording) {
-        ESP_LOGD(TAG, "回调函数：录音已停止，忽略数据");
-        return false;  // 停止录音
+        return false;
     }
     
     // 检查缓冲区是否有足够空间
     if (audio_buf->data_size + size > audio_buf->buffer_size) {
-        ESP_LOGW(TAG, "音频缓冲区已满，停止录音 (已用: %d, 新增: %d, 总容量: %d)", 
-                 audio_buf->data_size, size, audio_buf->buffer_size);
-        return false;  // 缓冲区满，停止录音
+        ESP_LOGW(TAG, "音频缓冲区已满，停止录音");
+        return false;
     }
     
     // 复制数据到缓冲区
     memcpy(audio_buf->buffer + audio_buf->data_size, data, size);
     audio_buf->data_size += size;
     
-    // 每收集 1MB 数据打印一次日志
-    static size_t last_log_size = 0;
-    if (audio_buf->data_size - last_log_size >= 1024 * 1024) {
-        ESP_LOGI(TAG, "已收集音频数据: %d KB / %d KB", 
-                 audio_buf->data_size / 1024, audio_buf->buffer_size / 1024);
-        last_log_size = audio_buf->data_size;
-    }
-    
-    return true;  // 继续录音
+    return true;
 }
 
 // 创建WAV文件头（在内存中）
@@ -81,19 +84,19 @@ static void create_wav_header_in_memory(uint8_t *buffer, uint32_t data_size,
                                         uint16_t sample_rate, uint16_t channels,
                                         uint16_t bits_per_sample) {
     typedef struct {
-        char chunk_id[4];        // "RIFF"
-        uint32_t chunk_size;     // 文件大小 - 8
-        char format[4];          // "WAVE"
-        char subchunk1_id[4];    // "fmt "
-        uint32_t subchunk1_size;  // 16 for PCM
-        uint16_t audio_format;   // 1 for PCM
-        uint16_t num_channels;   // 1 or 2
-        uint32_t sample_rate;    // 16000, 44100, etc.
-        uint32_t byte_rate;      // sample_rate * num_channels * bits_per_sample / 8
-        uint16_t block_align;    // num_channels * bits_per_sample / 8
-        uint16_t bits_per_sample;// 16, 24, 32, etc.
-        char subchunk2_id[4];    // "data"
-        uint32_t subchunk2_size; // data_size
+        char chunk_id[4];
+        uint32_t chunk_size;
+        char format[4];
+        char subchunk1_id[4];
+        uint32_t subchunk1_size;
+        uint16_t audio_format;
+        uint16_t num_channels;
+        uint32_t sample_rate;
+        uint32_t byte_rate;
+        uint16_t block_align;
+        uint16_t bits_per_sample;
+        char subchunk2_id[4];
+        uint32_t subchunk2_size;
     } wav_header_t;
 
     wav_header_t *header = (wav_header_t *)buffer;
@@ -104,7 +107,7 @@ static void create_wav_header_in_memory(uint8_t *buffer, uint32_t data_size,
     memcpy(header->format, "WAVE", 4);
     memcpy(header->subchunk1_id, "fmt ", 4);
     header->subchunk1_size = 16;
-    header->audio_format = 1;  // PCM
+    header->audio_format = 1;
     header->num_channels = channels;
     header->sample_rate = sample_rate;
     header->byte_rate = sample_rate * channels * bits_per_sample / 8;
@@ -114,466 +117,365 @@ static void create_wav_header_in_memory(uint8_t *buffer, uint32_t data_size,
     header->subchunk2_size = data_size;
 }
 
-// 录音任务（直接录音到内存，不保存文件，每30秒录音一次）
-static void record_task(void *pvParameters) {
-    ESP_LOGI(TAG, "开始录音任务（内存模式，UUID: %s，文件计数器: %d）", g_current_uuid, g_file_counter);
+// 上传任务运行标志（独立于录音任务）
+static bool g_upload_task_running = false;
 
-    while (g_record_task_running) {
-        
-        // 计算需要的缓冲区大小（30秒录音）
-        int samples_to_record = RECORD_SAMPLE_RATE * RECORD_DURATION_SEC;
-        int bytes_per_sample = RECORD_CHANNELS * RECORD_BITS_PER_SAMPLE / 8;
-        size_t audio_data_size = samples_to_record * bytes_per_sample;
-        size_t wav_header_size = 44;  // WAV文件头大小
-        size_t total_buffer_size = wav_header_size + audio_data_size;
-        
-        // 检查可用内存
-        size_t free_heap = esp_get_free_heap_size();
-        size_t free_spiram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
-        size_t largest_free_block = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-        
-        ESP_LOGI(TAG, "内存状态 - 总空闲: %d KB, PSRAM空闲: %d KB, 最大空闲块: %d KB, 需要: %d KB",
-                 free_heap / 1024, free_spiram / 1024, largest_free_block / 1024, total_buffer_size / 1024);
-        
-        // 优先从PSRAM分配内存，如果失败则尝试普通内存
-        uint8_t *wav_buffer = NULL;
-        
-        // 尝试从PSRAM分配（如果可用）
-        if (free_spiram >= total_buffer_size) {
-            wav_buffer = (uint8_t *)heap_caps_malloc(total_buffer_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-            if (wav_buffer != NULL) {
-                ESP_LOGI(TAG, "从PSRAM分配内存成功: %d KB", total_buffer_size / 1024);
-            }
-        }
-        
-        // 如果PSRAM分配失败，尝试从普通内存分配
-        if (wav_buffer == NULL) {
-            if (free_heap >= total_buffer_size) {
-                wav_buffer = (uint8_t *)heap_caps_malloc(total_buffer_size, MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
-                if (wav_buffer != NULL) {
-                    ESP_LOGW(TAG, "从普通内存分配成功: %d KB (PSRAM不可用或不足)", total_buffer_size / 1024);
-                }
-            }
-        }
-        
-        // 如果仍然失败，尝试任何可用的内存
-        if (wav_buffer == NULL) {
-            wav_buffer = (uint8_t *)malloc(total_buffer_size);
-            if (wav_buffer != NULL) {
-                ESP_LOGW(TAG, "使用标准malloc分配: %d KB", total_buffer_size / 1024);
-            }
-        }
-        
-        // 如果内存分配失败，强制使用分块录音模式
-        bool use_chunk_mode = false;
-        if (wav_buffer == NULL) {
-             ESP_LOGW(TAG, "内存不足，强制切换到分块录音模式");
-             use_chunk_mode = true;
-        }
-        
-        if (use_chunk_mode) {
-            // ========== 分块录音模式 ==========
-            // 动态调整分块大小
-            int chunk_duration = RECORD_CHUNK_DURATION_SEC;
-            
-            // 预检查内存，如果不够10秒（约320KB），则降级到5秒（约160KB）
-            size_t est_chunk_size = wav_header_size + (RECORD_SAMPLE_RATE * chunk_duration * bytes_per_sample);
-            size_t current_free_spiram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
-            size_t current_free_internal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
-            
-            if (est_chunk_size > current_free_spiram && est_chunk_size > current_free_internal) {
-                if (chunk_duration > 5) {
-                    chunk_duration = 5;
-                    ESP_LOGW(TAG, "可用内存不足以支持 %d 秒分块，自动降级为 %d 秒", RECORD_CHUNK_DURATION_SEC, chunk_duration);
-                }
-            }
-
-            int samples_per_chunk = RECORD_SAMPLE_RATE * chunk_duration;
-            size_t chunk_audio_size = samples_per_chunk * bytes_per_sample;
-            size_t chunk_buffer_size = wav_header_size + chunk_audio_size;
-            int total_chunks = (RECORD_DURATION_SEC + chunk_duration - 1) / chunk_duration;
-            
-            ESP_LOGI(TAG, "开始分块录音: note_box_%s_%s_%d.wav，共 %d 块 (每块%d秒)", 
-                     USER_ID, g_current_uuid, g_file_counter, total_chunks, chunk_duration);
+// 上传任务（异步上传，不阻塞录音）
+static void upload_task(void *pvParameters) {
+    ESP_LOGI(TAG, "上传任务启动");
+    g_upload_task_running = true;
+    
+    upload_item_t item;
+    
+    // 持续运行直到被明确停止，并且队列为空
+    while (g_upload_task_running || uxQueueMessagesWaiting(g_upload_queue) > 0) {
+        // 等待上传队列中的数据（最多等待1秒）
+        if (xQueueReceive(g_upload_queue, &item, pdMS_TO_TICKS(1000)) == pdTRUE) {
+            ESP_LOGI(TAG, "========== 开始上传 ==========");
+            ESP_LOGI(TAG, "文件名: %s", item.filename);
+            ESP_LOGI(TAG, "文件大小: %zu KB", item.wav_size / 1024);
+            ESP_LOGI(TAG, "队列剩余: %d 个文件", uxQueueMessagesWaiting(g_upload_queue));
+            ESP_LOGI(TAG, "==============================");
             
             // 构建上传URL
             char url[512];
             snprintf(url, sizeof(url), "%s%s", CG_API_URL, API_UPLOAD);
             
-            for (int chunk_idx = 0; chunk_idx < total_chunks && g_record_task_running; chunk_idx++) {
-                // 分配分块缓冲区
-                uint8_t *chunk_buffer = NULL;
-                if (free_spiram >= chunk_buffer_size) {
-                    chunk_buffer = (uint8_t *)heap_caps_malloc(chunk_buffer_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-                }
-                if (chunk_buffer == NULL && free_heap >= chunk_buffer_size) {
-                    chunk_buffer = (uint8_t *)heap_caps_malloc(chunk_buffer_size, MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
-                }
-                if (chunk_buffer == NULL) {
-                    chunk_buffer = (uint8_t *)malloc(chunk_buffer_size);
-                }
-                
-                if (chunk_buffer == NULL) {
-                    ESP_LOGE(TAG, "无法分配分块缓冲区（块 %d/%d）", chunk_idx + 1, total_chunks);
-                    vTaskDelay(pdMS_TO_TICKS(1000));
-                    continue;
-                }
-                
-                // 初始化音频缓冲区结构
-                audio_buffer_t audio_buf = {
-                    .buffer = chunk_buffer + wav_header_size,
-                    .buffer_size = chunk_audio_size,
-                    .data_size = 0,
-                    .recording = true
-                };
-                
-                ESP_LOGI(TAG, "开始录音块 %d/%d", chunk_idx + 1, total_chunks);
-                
-                // 启动录音
-                esp_err_t ret = audio_recorder_start_with_callback(audio_data_callback, &audio_buf);
-                if (ret != ESP_OK) {
-                    ESP_LOGE(TAG, "启动录音失败（块 %d）", chunk_idx + 1);
-                    free(chunk_buffer);
-                    vTaskDelay(pdMS_TO_TICKS(1000));
-                    continue;
-                }
-                
-                // 等待录音完成（定期检查停止标志）
-                int wait_count = 0;
-                int max_wait_count = (chunk_duration * 1000 + 500) / 100;
-                while (wait_count < max_wait_count && g_record_task_running && audio_recorder_is_recording()) {
-                    vTaskDelay(pdMS_TO_TICKS(100));
-                    wait_count++;
-                }
-                
-                // 停止录音
-                audio_buf.recording = false;
-                audio_recorder_stop();
-                
-                // 等待录音任务结束
-                int stop_wait_count = 0;
-                while (audio_recorder_is_recording() && stop_wait_count < 50) {
-                    vTaskDelay(pdMS_TO_TICKS(100));
-                    stop_wait_count++;
-                }
-                
-                if (audio_buf.data_size == 0) {
-                    ESP_LOGW(TAG, "录音数据为空（块 %d）", chunk_idx + 1);
-                    free(chunk_buffer);
-                    continue;
-                }
-                
-                ESP_LOGI(TAG, "录音块 %d 完成，数据大小: %d 字节", chunk_idx + 1, audio_buf.data_size);
-                
-                // 创建WAV文件头
-                create_wav_header_in_memory(chunk_buffer, audio_buf.data_size,
-                                           RECORD_SAMPLE_RATE, RECORD_CHANNELS,
-                                           RECORD_BITS_PER_SAMPLE);
-                
-                size_t chunk_file_size = wav_header_size + audio_buf.data_size;
-                
-                // 构建文件名（每块使用不同的文件名，格式：note_box_{USER_ID}_{UUID}_{i}_chunk{chunk_idx}.wav）
-                char filename[128];
-                snprintf(filename, sizeof(filename), "note_box_%s_%s_%d_chunk%d.wav", USER_ID, g_current_uuid, g_file_counter, chunk_idx);
-                
-                // 上传
-                http_request_config_t upload_config = {
-                    .url = url,
-                    .method = "POST",
-                    .token = CG_TOKEN,
-                    .timeout_ms = 30000,
-                    .ssl_verify_mode = HTTP_SSL_VERIFY_NONE,  // 跳过证书验证（开发环境）
-                };
-                
-                // 上传前检查内存状态（HTTPS握手需要约20-40KB内部RAM）
-                size_t free_internal_before = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
-                if (free_internal_before < 50 * 1024) {  // 少于50KB
-                    ESP_LOGW(TAG, "分块上传前内存警告：内部RAM仅 %zu KB", free_internal_before / 1024);
-                    utils_print_memory_breakdown();
-                }
-                
-                int status_code = 0;
-                char response_buffer[512] = {0};
-                // 使用流式上传，避免文件数据重复占用内存
-                ret = http_client_post_multipart_streaming(&upload_config, chunk_buffer, chunk_file_size,
-                                                           filename, "file", "fileName",
-                                                           &status_code, response_buffer, sizeof(response_buffer));
-                
-            if (ret == ESP_OK && status_code == 200) {
-                ESP_LOGI(TAG, "块 %d 上传成功，响应: %s", chunk_idx + 1, response_buffer);
-        } else {
-                ESP_LOGW(TAG, "块 %d 上传失败，状态码: %d", chunk_idx + 1, status_code);
-            }
-            
-            // 立即释放内存
-            free(chunk_buffer);
-            
-            // 块之间稍作延迟
-            if (chunk_idx < total_chunks - 1) {
-                vTaskDelay(pdMS_TO_TICKS(500));
-            }
-        }
-        
-        // 所有块上传完成后，递增文件计数器
-        g_file_counter++;
-        ESP_LOGI(TAG, "完成分块录音（%d块），文件计数器递增至: %d", total_chunks, g_file_counter);
-        
-        // 等待到下一轮录音（如果还在运行）
-        if (g_record_task_running) {
-            ESP_LOGI(TAG, "等待下一轮录音...");
-            vTaskDelay(pdMS_TO_TICKS(1000));  // 短暂延迟后继续循环
-        }
-        } else {
-            // ========== 一次性录音模式 ==========
-            // 初始化音频缓冲区结构
-            audio_buffer_t audio_buf = {
-                .buffer = wav_buffer + wav_header_size,  // 音频数据从WAV头之后开始
-                .buffer_size = audio_data_size,
-                .data_size = 0,
-                .recording = true
-            };
-            
-            ESP_LOGI(TAG, "开始录音（内存模式）: note_box_%s_%s_%d.wav", USER_ID, g_current_uuid, g_file_counter);
-            
-            // 使用回调模式录音到内存
-            esp_err_t ret = audio_recorder_start_with_callback(audio_data_callback, &audio_buf);
-            if (ret != ESP_OK) {
-                ESP_LOGE(TAG, "启动录音失败");
-                free(wav_buffer);
-                vTaskDelay(pdMS_TO_TICKS(1000));
-            continue;
-        }
-
-            // 等待录音完成（定期检查数据收集情况和停止标志）
-            int wait_count = 0;
-            int max_wait_count = (RECORD_DURATION_SEC * 1000 + 2000) / 100;  // 总等待时间 + 2秒缓冲
-            size_t last_data_size = 0;
-            int no_data_increase_count = 0;
-            
-            while (wait_count < max_wait_count && g_record_task_running && audio_recorder_is_recording()) {
-                vTaskDelay(pdMS_TO_TICKS(100));
-                wait_count++;
-                
-                // 检查停止标志
-                if (!g_record_task_running) {
-                    ESP_LOGI(TAG, "检测到停止标志，立即停止录音");
-                    break;
-                }
-                
-                // 每5秒检查一次数据收集情况
-                if (wait_count % 50 == 0) {
-                    size_t current_data_size = audio_buf.data_size;
-                    if (current_data_size > last_data_size) {
-                        ESP_LOGI(TAG, "录音进行中，已收集: %d KB / %d KB (等待 %d 秒)", 
-                                 current_data_size / 1024, audio_data_size / 1024, wait_count / 10);
-                        last_data_size = current_data_size;
-                        no_data_increase_count = 0;
-                    } else {
-                        no_data_increase_count++;
-                        if (no_data_increase_count >= 10) {  // 连续10次（5秒）没有数据增长
-                            ESP_LOGW(TAG, "录音任务运行中，但未收集到数据（可能I2S无输入）");
-                            no_data_increase_count = 0;  // 重置计数，继续等待
-                        }
-                    }
-                }
-            }
-            
-            // 停止录音
-            audio_buf.recording = false;
-            audio_recorder_stop();
-            
-            // 等待录音任务完全结束
-            int stop_wait_count = 0;
-            while (audio_recorder_is_recording() && stop_wait_count < 100) {
-                vTaskDelay(pdMS_TO_TICKS(100));
-                stop_wait_count++;
-            }
-            
-            if (audio_buf.data_size == 0) {
-                ESP_LOGE(TAG, "录音数据为空！可能原因：1. I2S未读取到数据 2. 麦克风未连接 3. I2S配置错误");
-                ESP_LOGE(TAG, "录音任务状态: %s, 等待次数: %d", 
-                         audio_recorder_is_recording() ? "运行中" : "已停止", wait_count);
-                free(wav_buffer);
-            continue;
-        }
-
-            float data_size_kb = (float)audio_buf.data_size / 1024.0f;
-            float duration_sec = (float)audio_buf.data_size / ((float)RECORD_SAMPLE_RATE * (float)RECORD_CHANNELS * (float)RECORD_BITS_PER_SAMPLE / 8.0f);
-            ESP_LOGI(TAG, "录音完成，数据大小: %d 字节 (%.2f KB, 约 %.1f 秒)", 
-                     audio_buf.data_size, data_size_kb, duration_sec);
-            
-            // 创建WAV文件头
-            create_wav_header_in_memory(wav_buffer, audio_buf.data_size,
-                                       RECORD_SAMPLE_RATE, RECORD_CHANNELS,
-                                       RECORD_BITS_PER_SAMPLE);
-            
-            // 构建完整的WAV文件（头 + 数据）
-            size_t wav_file_size = wav_header_size + audio_buf.data_size;
-            
-            // 构建文件名（格式：note_box_{USER_ID}_{UUID}_{i}.wav）
-            char filename[128];
-            snprintf(filename, sizeof(filename), "note_box_%s_%s_%d.wav", USER_ID, g_current_uuid, g_file_counter);
-            
-            // 构建上传URL
-            char url[512];
-            snprintf(url, sizeof(url), "%s%s", CG_API_URL, API_UPLOAD);
-            
-            // 上传前检查内存状态（HTTPS握手需要约20-40KB内部RAM）
-            size_t free_internal_before = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
-            size_t min_free_before = esp_get_minimum_free_heap_size();
-            ESP_LOGI(TAG, "上传前内存检查 - 内部RAM可用: %zu KB, 历史最小: %zu KB", 
-                     free_internal_before / 1024, min_free_before / 1024);
-            
-            // 如果内部RAM不足，打印详细内存分解
-            if (free_internal_before < 50 * 1024) {  // 少于50KB
-                ESP_LOGW(TAG, "警告：内部RAM不足（%zu KB），HTTPS握手可能需要20-40KB", free_internal_before / 1024);
-                ESP_LOGW(TAG, "打印详细内存占用分解...");
-                // 打印详细内存分解，显示各个组件的占用情况
-                utils_print_memory_breakdown();
-            }
-            
-            // 使用HttpClient模块从内存上传
             http_request_config_t upload_config = {
                 .url = url,
                 .method = "POST",
                 .token = CG_TOKEN,
-                .timeout_ms = 30000,
-                .ssl_verify_mode = HTTP_SSL_VERIFY_NONE,  // 跳过证书验证（开发环境）
+                .timeout_ms = 120000,
+                .ssl_verify_mode = HTTP_SSL_VERIFY_NONE,
             };
 
             int status_code = 0;
             char response_buffer[512] = {0};
-            // 使用流式上传，避免文件数据重复占用内存
-            // 内存占用：仅multipart头部和尾部（约200-300字节），而不是文件大小+头部+尾部
-            ret = http_client_post_multipart_streaming(&upload_config, wav_buffer, wav_file_size,
-                                                       filename, "file", "fileName",
-                                                       &status_code, response_buffer, sizeof(response_buffer));
-            
-            // 上传后检查内存状态
-            size_t free_internal_after = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
-            ESP_LOGI(TAG, "上传后内存检查 - 内部RAM可用: %zu KB (变化: %d KB)", 
-                     free_internal_after / 1024, 
-                     (int)(free_internal_after - free_internal_before) / 1024);
+            esp_err_t ret = http_client_post_multipart_from_memory(
+                &upload_config, item.wav_buffer, item.wav_size,
+                item.filename, "file", "fileName",
+                &status_code, response_buffer, sizeof(response_buffer));
             
             if (ret == ESP_OK && status_code == 200) {
-                ESP_LOGI(TAG, "上传成功，响应: %s", response_buffer);
-                // 上传成功后，递增文件计数器
-                g_file_counter++;
-                ESP_LOGI(TAG, "文件计数器递增至: %d", g_file_counter);
+                ESP_LOGI(TAG, "上传成功: %s", item.filename);
             } else {
-                ESP_LOGW(TAG, "上传失败，状态码: %d", status_code);
+                ESP_LOGW(TAG, "上传失败: %s, 状态码: %d", item.filename, status_code);
             }
             
-            // 释放内存缓冲区
+            // 释放缓冲区
+            free(item.wav_buffer);
+            ESP_LOGI(TAG, "已释放上传缓冲区，队列剩余: %d", uxQueueMessagesWaiting(g_upload_queue));
+        }
+    }
+    
+    ESP_LOGI(TAG, "上传任务结束（所有文件已处理）");
+    g_upload_task_handle = NULL;
+    vTaskDelete(NULL);
+}
+
+// 录音任务（连续录音，录音完成后放入上传队列）
+static void record_task(void *pvParameters) {
+    ESP_LOGI(TAG, "录音任务启动（UUID: %s）", g_current_uuid);
+    
+    const size_t wav_header_size = 44;
+    const int bytes_per_sample = RECORD_CHANNELS * RECORD_BITS_PER_SAMPLE / 8;
+    const int samples_to_record = RECORD_SAMPLE_RATE * RECORD_DURATION_SEC;
+    const size_t audio_data_size = samples_to_record * bytes_per_sample;
+    const size_t total_buffer_size = wav_header_size + audio_data_size;
+
+    while (g_record_task_running) {
+        
+        // 检查可用内存
+        size_t free_spiram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+        ESP_LOGI(TAG, "内存状态 - PSRAM空闲: %d KB, 需要: %d KB, 上传队列: %d/%d",
+                 free_spiram / 1024, total_buffer_size / 1024,
+                 uxQueueMessagesWaiting(g_upload_queue), UPLOAD_QUEUE_SIZE);
+        
+        // 如果上传队列已满，等待队列有空位
+        if (uxQueueMessagesWaiting(g_upload_queue) >= UPLOAD_QUEUE_SIZE) {
+            ESP_LOGW(TAG, "上传队列已满，等待上传完成...");
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+        
+        // 分配内存（优先PSRAM）
+        uint8_t *wav_buffer = NULL;
+        if (free_spiram >= total_buffer_size) {
+            wav_buffer = (uint8_t *)heap_caps_malloc(total_buffer_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+        }
+        if (wav_buffer == NULL) {
+            wav_buffer = (uint8_t *)malloc(total_buffer_size);
+        }
+        
+        if (wav_buffer == NULL) {
+            ESP_LOGE(TAG, "无法分配录音缓冲区，等待 5 秒后重试");
+            vTaskDelay(pdMS_TO_TICKS(5000));
+            continue;
+        }
+        
+        ESP_LOGI(TAG, "分配录音缓冲区成功: %d KB", total_buffer_size / 1024);
+        
+        // 初始化音频缓冲区
+        audio_buffer_t audio_buf = {
+            .buffer = wav_buffer + wav_header_size,
+            .buffer_size = audio_data_size,
+            .data_size = 0,
+            .recording = true
+        };
+        
+        // 构建文件名
+        char filename[128];
+        snprintf(filename, sizeof(filename), "note_box_%s_%s_%d.wav", 
+                 USER_ID, g_current_uuid, g_file_counter);
+        
+        ESP_LOGI(TAG, "===== 开始录音 #%d =====", g_file_counter);
+        ESP_LOGI(TAG, "文件名: %s", filename);
+        ESP_LOGI(TAG, "时长: %d 秒", RECORD_DURATION_SEC);
+        
+        // 启动录音
+        esp_err_t ret = audio_recorder_start_with_callback(audio_data_callback, &audio_buf);
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "启动录音失败");
             free(wav_buffer);
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+
+        // 等待录音完成
+        int wait_count = 0;
+        int max_wait_count = (RECORD_DURATION_SEC * 1000 + 2000) / 100;
+        
+        while (wait_count < max_wait_count && g_record_task_running && audio_recorder_is_recording()) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            wait_count++;
             
-            // 等待到下一轮录音（如果还在运行）
-            if (g_record_task_running) {
-                ESP_LOGI(TAG, "等待下一轮录音...");
-                vTaskDelay(pdMS_TO_TICKS(1000));  // 短暂延迟后继续循环
+            if (!g_record_task_running) {
+                ESP_LOGI(TAG, "检测到停止标志");
+                break;
+            }
+            
+            // 每10秒打印进度
+            if (wait_count % 100 == 0) {
+                ESP_LOGI(TAG, "录音进度: %d KB / %d KB (%d秒)", 
+                         audio_buf.data_size / 1024, audio_data_size / 1024, wait_count / 10);
             }
         }
+        
+        // 停止录音
+        audio_buf.recording = false;
+        audio_recorder_stop();
+        
+        // 等待录音完全停止
+        int stop_wait = 0;
+        while (audio_recorder_is_recording() && stop_wait < 50) {
+            vTaskDelay(pdMS_TO_TICKS(100));
+            stop_wait++;
+        }
+        
+        if (audio_buf.data_size == 0) {
+            ESP_LOGE(TAG, "录音数据为空！");
+            free(wav_buffer);
+            continue;
+        }
+
+        float duration_sec = (float)audio_buf.data_size / (RECORD_SAMPLE_RATE * bytes_per_sample);
+        ESP_LOGI(TAG, "录音完成: %d KB (约 %.1f 秒)", audio_buf.data_size / 1024, duration_sec);
+        
+        // 创建WAV文件头
+        create_wav_header_in_memory(wav_buffer, audio_buf.data_size,
+                                   RECORD_SAMPLE_RATE, RECORD_CHANNELS,
+                                   RECORD_BITS_PER_SAMPLE);
+        
+        size_t wav_file_size = wav_header_size + audio_buf.data_size;
+        
+        // 将录音数据放入上传队列（不阻塞，立即开始下一轮录音）
+        upload_item_t item = {
+            .wav_buffer = wav_buffer,
+            .wav_size = wav_file_size,
+        };
+        strncpy(item.filename, filename, sizeof(item.filename) - 1);
+        
+        if (xQueueSend(g_upload_queue, &item, pdMS_TO_TICKS(100)) == pdTRUE) {
+            ESP_LOGI(TAG, "录音 #%d 已加入上传队列", g_file_counter);
+            g_file_counter++;
+        } else {
+            ESP_LOGW(TAG, "上传队列已满，丢弃录音 #%d", g_file_counter);
+            free(wav_buffer);
+        }
+        
+        // 立即开始下一轮录音（无需等待上传完成）
+        ESP_LOGI(TAG, "===== 准备下一轮录音 =====");
     }
 
     g_record_task_running = false;
     g_record_task_handle = NULL;
+    ESP_LOGI(TAG, "录音任务结束");
     vTaskDelete(NULL);
 }
 
 int start_note_recording(void) {
     if (g_record_task_running) {
-        ESP_LOGW(TAG, "录音业务逻辑已在进行中");
+        ESP_LOGW(TAG, "录音已在进行中");
         return 0;
     }
 
-    // 生成新的UUID并初始化文件计数器
+    // 生成UUID
     if (utils_generate_uuid(g_current_uuid, sizeof(g_current_uuid)) != 0) {
         ESP_LOGE(TAG, "生成UUID失败");
         return -1;
     }
-    g_file_counter = 1;  // 初始化计数器为1
+    g_file_counter = 1;
     
-    ESP_LOGI(TAG, "开始新的录音会话，UUID: %s，文件计数器: %d", g_current_uuid, g_file_counter);
+    ESP_LOGI(TAG, "========================================");
+    ESP_LOGI(TAG, "开始新的录音会话");
+    ESP_LOGI(TAG, "UUID: %s", g_current_uuid);
+    ESP_LOGI(TAG, "录音时长: %d 秒/次", RECORD_DURATION_SEC);
+    ESP_LOGI(TAG, "上传队列大小: %d", UPLOAD_QUEUE_SIZE);
+    ESP_LOGI(TAG, "========================================");
 
-    // 初始化录音器（不需要文件系统）
+    // 创建上传队列
+    if (g_upload_queue == NULL) {
+        g_upload_queue = xQueueCreate(UPLOAD_QUEUE_SIZE, sizeof(upload_item_t));
+        if (g_upload_queue == NULL) {
+            ESP_LOGE(TAG, "创建上传队列失败");
+            return -1;
+        }
+    }
+
+    // 初始化录音器
     esp_err_t ret = audio_recorder_init(NULL);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "初始化录音器失败");
         return -1;
     }
 
-    // 启动录音任务（该任务会循环录音和上传，每30秒一次）
     g_record_task_running = true;
+    
+    // 启动上传任务
+    xTaskCreate(upload_task, "upload_task", 8192, NULL, 4, &g_upload_task_handle);
+    
+    // 启动录音任务（优先级高于上传任务）
     xTaskCreate(record_task, "record_task", 8192, NULL, 5, &g_record_task_handle);
     
-    ESP_LOGI(TAG, "开始录音业务逻辑（每30秒录音一次）");
     return 0;
 }
 
 int stop_note_recording(void) {
-    if (!g_record_task_running) {
-        ESP_LOGW(TAG, "录音业务逻辑未在进行");
+    if (!g_record_task_running && !g_upload_task_running) {
+        ESP_LOGW(TAG, "录音未在进行");
         return 0;
     }
 
-    ESP_LOGI(TAG, "开始停止录音业务逻辑...");
+    ESP_LOGI(TAG, "停止录音...");
     
-    // 停止录音任务循环（这会立即被回调函数和等待循环检测到）
+    // 1. 先停止录音任务
     g_record_task_running = false;
     
-    // 停止当前正在进行的录音
     if (audio_recorder_is_recording()) {
-        ESP_LOGI(TAG, "停止当前录音...");
         audio_recorder_stop();
-        
-        // 等待录音完全停止
-        int wait_count = 0;
-        while (audio_recorder_is_recording() && wait_count < 50) {
+        int wait = 0;
+        while (audio_recorder_is_recording() && wait < 50) {
             vTaskDelay(pdMS_TO_TICKS(100));
-            wait_count++;
+            wait++;
         }
     }
     
     // 等待录音任务结束
-    if (g_record_task_handle != NULL) {
-        ESP_LOGI(TAG, "等待录音任务结束...");
-        int wait_count = 0;
-        while (g_record_task_handle != NULL && wait_count < 50) {
-            vTaskDelay(pdMS_TO_TICKS(100));
-            wait_count++;
+    int wait = 0;
+    while (g_record_task_handle != NULL && wait < 50) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+        wait++;
+    }
+    ESP_LOGI(TAG, "录音任务已停止");
+    
+    // 2. 等待上传任务处理完队列中的所有数据
+    int queue_count = uxQueueMessagesWaiting(g_upload_queue);
+    if (queue_count > 0) {
+        ESP_LOGI(TAG, "等待上传队列中的 %d 个文件上传完成...", queue_count);
+    }
+    
+    wait = 0;
+    while (uxQueueMessagesWaiting(g_upload_queue) > 0 && wait < 600) {  // 最多等待60秒
+        vTaskDelay(pdMS_TO_TICKS(100));
+        wait++;
+        if (wait % 50 == 0) {
+            ESP_LOGI(TAG, "等待上传完成，队列剩余: %d", uxQueueMessagesWaiting(g_upload_queue));
         }
     }
+    
+    // 3. 队列清空后，停止上传任务
+    g_upload_task_running = false;
+    
+    wait = 0;
+    while (g_upload_task_handle != NULL && wait < 50) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+        wait++;
+    }
+    ESP_LOGI(TAG, "上传任务已停止");
 
-    // 清理录音器
+    // 4. 保存UUID副本（在清空前）
+    char uuid_copy[64];
+    strncpy(uuid_copy, g_current_uuid, sizeof(uuid_copy) - 1);
+    uuid_copy[sizeof(uuid_copy) - 1] = '\0';
+    
+    // 5. 清理
     audio_recorder_deinit();
     
-    // 重置UUID和计数器
+    if (g_upload_queue != NULL) {
+        vQueueDelete(g_upload_queue);
+        g_upload_queue = NULL;
+    }
+    
     memset(g_current_uuid, 0, sizeof(g_current_uuid));
     g_file_counter = 0;
 
-    ESP_LOGI(TAG, "录音业务逻辑已停止");
+    ESP_LOGI(TAG, "录音已完全停止，所有文件已上传");
+    
+    // 6. 使用保存的UUID副本调用生成笔记接口
+    if (strlen(uuid_copy) > 0) {
+        int ret = generate_note(uuid_copy, "box", true, 2, "box1.0");
+        if (ret != 0) {
+            ESP_LOGE(TAG, "生成笔记失败");
+            return -1;
+        }
+    } else {
+        ESP_LOGW(TAG, "UUID为空，跳过生成笔记");
+    }
+    
     return 0;
 }
 
-int generate_note(const char *note_id, const char *device, bool is_voice, int type, const char *version) {
-    if (note_id == NULL || device == NULL || version == NULL) {
-        ESP_LOGE(TAG, "参数不能为空");
-        return -1;
+// 生成笔记任务参数
+typedef struct {
+    char note_id[64];
+    char device[32];
+    bool is_voice;
+    int type;
+    char version[16];
+} generate_note_params_t;
+
+// 生成笔记任务（在独立任务中执行，避免占用 main 任务栈）
+static void generate_note_task(void *pvParameters) {
+    generate_note_params_t *params = (generate_note_params_t *)pvParameters;
+    
+    ESP_LOGI(TAG, "生成笔记任务启动，UUID: %s", params->note_id);
+    
+    // 使用动态分配减少栈压力
+    char *url = (char *)malloc(256);
+    char *json_body = (char *)malloc(256);
+    char *response_buffer = (char *)malloc(256);
+    
+    if (url == NULL || json_body == NULL || response_buffer == NULL) {
+        ESP_LOGE(TAG, "生成笔记：内存分配失败");
+        goto cleanup;
     }
-
-    char url[512];
-    snprintf(url, sizeof(url), "%s%s", CG_API_URL, API_NOTE);
-
-    // 构建JSON请求体
-    char json_body[512];
-    snprintf(json_body, sizeof(json_body),
+    
+    snprintf(url, 256, "%s%s", CG_API_URL, API_NOTE);
+    snprintf(json_body, 256,
         "{\"id\":\"%s\",\"device\":\"%s\",\"isVoice\":%s,\"type\":%d,\"v\":\"%s\"}",
-        note_id, device, is_voice ? "true" : "false", type, version);
+        params->note_id, params->device, params->is_voice ? "true" : "false", 
+        params->type, params->version);
 
-    ESP_LOGI(TAG, "生成笔记，URL: %s", url);
-    ESP_LOGI(TAG, "请求体: %s", json_body);
-
-    // 使用HttpClient模块发送JSON请求
     http_request_config_t config = {
         .url = url,
         .method = "POST",
@@ -581,21 +483,68 @@ int generate_note(const char *note_id, const char *device, bool is_voice, int ty
         .token = CG_TOKEN,
         .body = json_body,
         .body_len = strlen(json_body),
-        .timeout_ms = 30000,
-        .ssl_verify_mode = HTTP_SSL_VERIFY_NONE,  // 跳过证书验证（开发环境）
+        .timeout_ms = 60000,
+        .ssl_verify_mode = HTTP_SSL_VERIFY_NONE,
     };
 
     int status_code = 0;
-    char response_buffer[512] = {0};
-    esp_err_t err = http_client_post_json(&config, &status_code, response_buffer, sizeof(response_buffer));
+    response_buffer[0] = '\0';
+    esp_err_t err = http_client_post_json(&config, &status_code, response_buffer, 256);
     
     if (err == ESP_OK && status_code == 200) {
-        ESP_LOGI(TAG, "生成笔记成功，响应: %s", response_buffer);
-            return 0;
-        } else {
-            ESP_LOGW(TAG, "生成笔记失败，状态码: %d", status_code);
+        ESP_LOGI(TAG, "生成笔记成功");
+    } else {
+        ESP_LOGW(TAG, "生成笔记失败，状态码: %d", status_code);
+    }
+
+cleanup:
+    if (url) free(url);
+    if (json_body) free(json_body);
+    if (response_buffer) free(response_buffer);
+    free(params);
+    
+    ESP_LOGI(TAG, "生成笔记任务结束");
+    vTaskDelete(NULL);
+}
+
+int generate_note(const char *note_id, const char *device, bool is_voice, int type, const char *version) {
+    if (note_id == NULL || device == NULL || version == NULL) {
+        ESP_LOGE(TAG, "参数不能为空");
         return -1;
     }
+    
+    if (strlen(note_id) == 0) {
+        ESP_LOGE(TAG, "note_id 不能为空字符串");
+        return -1;
+    }
+
+    // 分配参数结构体
+    generate_note_params_t *params = (generate_note_params_t *)malloc(sizeof(generate_note_params_t));
+    if (params == NULL) {
+        ESP_LOGE(TAG, "生成笔记：参数内存分配失败");
+        return -1;
+    }
+    
+    // 复制参数
+    strncpy(params->note_id, note_id, sizeof(params->note_id) - 1);
+    params->note_id[sizeof(params->note_id) - 1] = '\0';
+    strncpy(params->device, device, sizeof(params->device) - 1);
+    params->device[sizeof(params->device) - 1] = '\0';
+    params->is_voice = is_voice;
+    params->type = type;
+    strncpy(params->version, version, sizeof(params->version) - 1);
+    params->version[sizeof(params->version) - 1] = '\0';
+    
+    // 创建独立任务执行（8KB 栈空间）
+    BaseType_t ret = xTaskCreate(generate_note_task, "generate_note", 8192, params, 3, NULL);
+    if (ret != pdPASS) {
+        ESP_LOGE(TAG, "创建生成笔记任务失败");
+        free(params);
+        return -1;
+    }
+    
+    ESP_LOGI(TAG, "已启动生成笔记任务");
+    return 0;
 }
 
 bool is_recording(void) {

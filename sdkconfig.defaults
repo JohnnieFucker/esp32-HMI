@@ -22,8 +22,8 @@ CONFIG_FATFS_API_ENCODING_ANSI_OEM=y
 CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
 CONFIG_PARTITION_TABLE_CUSTOM=y
 
-# HTTP客户端配置 - 增加头部缓冲区大小以支持长Token
-CONFIG_ESP_HTTP_CLIENT_MAX_HTTP_HEADER_LEN=2048
+# 增加HTTP头部缓冲区大小（支持长token）
+CONFIG_ESP_HTTP_CLIENT_MAX_HTTP_HEADER_LEN=4096
 
 # mbedTLS内存配置 - 增加TLS/SSL握手时的内存池
 # HTTPS握手需要约20-40KB内部RAM，确保有足够内存
@@ -127,6 +127,9 @@ CONFIG_SR_MN_CN_NONE=y
 CONFIG_SR_MN_EN_MULTINET5_SINGLE_RECOGNITION_QUANT8=y
 # CONFIG_SR_MN_EN_MULTINET6_QUANT is not set
 # CONFIG_SR_MN_EN_MULTINET7_QUANT is not set
+
+# FreeRTOS Trace Facility for uxTaskGetSystemState
+CONFIG_FREERTOS_USE_TRACE_FACILITY=y
 
 #
 # Add Chinese speech commands
@@ -332,10 +335,7 @@ CONFIG_CN_SPEECH_COMMAND_ID196=""
 CONFIG_CN_SPEECH_COMMAND_ID197=""
 CONFIG_CN_SPEECH_COMMAND_ID198=""
 CONFIG_CN_SPEECH_COMMAND_ID199=""
-# end of Add English speech commands
-# end of ESP Speech Recognition
-
-
+# end of Add Chinese speech commands
 
 #
 # Add English speech commands
@@ -541,4 +541,3 @@ CONFIG_EN_SPEECH_COMMAND_ID197=""
 CONFIG_EN_SPEECH_COMMAND_ID198=""
 CONFIG_EN_SPEECH_COMMAND_ID199=""
 # end of Add English speech commands
-# end of ESP Speech Recognition

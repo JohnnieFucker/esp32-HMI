@@ -376,7 +376,9 @@ esp_err_t http_client_post_multipart_streaming(const http_request_config_t *conf
     }
     
     if (verify_mode == HTTP_SSL_VERIFY_NONE) {
-        ESP_LOGW(TAG, "警告：HTTPS证书验证已禁用，连接不安全！");
+        // 警告：HTTPS证书验证已禁用，连接不安全！
+        // 减少不必要的日志打印
+        // ESP_LOGW(TAG, "警告：HTTPS证书验证已禁用，连接不安全！");
         client_config.skip_cert_common_name_check = true;
         client_config.cert_pem = NULL;
         client_config.client_cert_pem = NULL;
@@ -385,6 +387,9 @@ esp_err_t http_client_post_multipart_streaming(const http_request_config_t *conf
 #ifdef ESP_HTTP_CLIENT_CONFIG_USE_GLOBAL_CA_STORE
         client_config.use_global_ca_store = false;
 #endif
+        // 显式禁用 mbedTLS 内存优化配置，可能会导致握手失败
+        // 如果内存足够，建议不设置此项或设置为false
+        // client_config.keep_alive_enable = true; 
     } else if (verify_mode == HTTP_SSL_VERIFY_CRT_BUNDLE) {
 #if HTTP_CLIENT_CRT_BUNDLE_AVAILABLE
         client_config.crt_bundle_attach = esp_crt_bundle_attach;

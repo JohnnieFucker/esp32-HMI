@@ -114,13 +114,13 @@ static void create_wav_header_in_memory(uint8_t *buffer, uint32_t data_size,
     header->subchunk2_size = data_size;
 }
 
-// 录音任务（直接录音到内存，不保存文件，每分钟录音一次）
+// 录音任务（直接录音到内存，不保存文件，每30秒录音一次）
 static void record_task(void *pvParameters) {
     ESP_LOGI(TAG, "开始录音任务（内存模式，UUID: %s，文件计数器: %d）", g_current_uuid, g_file_counter);
 
     while (g_record_task_running) {
         
-        // 计算需要的缓冲区大小（60秒录音）
+        // 计算需要的缓冲区大小（30秒录音）
         int samples_to_record = RECORD_SAMPLE_RATE * RECORD_DURATION_SEC;
         int bytes_per_sample = RECORD_CHANNELS * RECORD_BITS_PER_SAMPLE / 8;
         size_t audio_data_size = samples_to_record * bytes_per_sample;
@@ -323,9 +323,9 @@ static void record_task(void *pvParameters) {
         g_file_counter++;
         ESP_LOGI(TAG, "完成分块录音（%d块），文件计数器递增至: %d", total_chunks, g_file_counter);
         
-        // 等待到下一分钟（如果还在运行）
+        // 等待到下一轮录音（如果还在运行）
         if (g_record_task_running) {
-            ESP_LOGI(TAG, "等待下一分钟录音...");
+            ESP_LOGI(TAG, "等待下一轮录音...");
             vTaskDelay(pdMS_TO_TICKS(1000));  // 短暂延迟后继续循环
         }
         } else {
@@ -472,9 +472,9 @@ static void record_task(void *pvParameters) {
             // 释放内存缓冲区
             free(wav_buffer);
             
-            // 等待到下一分钟（如果还在运行）
+            // 等待到下一轮录音（如果还在运行）
             if (g_record_task_running) {
-                ESP_LOGI(TAG, "等待下一分钟录音...");
+                ESP_LOGI(TAG, "等待下一轮录音...");
                 vTaskDelay(pdMS_TO_TICKS(1000));  // 短暂延迟后继续循环
             }
         }
@@ -507,11 +507,11 @@ int start_note_recording(void) {
         return -1;
     }
 
-    // 启动录音任务（该任务会循环录音和上传，每分钟一次）
+    // 启动录音任务（该任务会循环录音和上传，每30秒一次）
     g_record_task_running = true;
     xTaskCreate(record_task, "record_task", 8192, NULL, 5, &g_record_task_handle);
     
-    ESP_LOGI(TAG, "开始录音业务逻辑（每分钟录音一次）");
+    ESP_LOGI(TAG, "开始录音业务逻辑（每30秒录音一次）");
     return 0;
 }
 

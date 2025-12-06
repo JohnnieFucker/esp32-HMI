@@ -26,7 +26,7 @@ static const wifi_config_item_t wifi_configs[WIFI_CONFIG_COUNT] = {
 
 // ==================== 录音配置 ====================
 // 录音时长（秒）
-#define RECORD_DURATION_SEC 60
+#define RECORD_DURATION_SEC 30
 
 // 是否启用分块录音模式（当内存不足时自动启用）
 // 分块模式：将长录音分成多个小块，每块录音后立即上传，减少内存占用

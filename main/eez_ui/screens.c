@@ -18,77 +18,32 @@
 objects_t objects;
 lv_obj_t *tick_value_change_obj;
 
-// 呼吸灯任务句柄
-static TaskHandle_t breathing_light_task_handle = NULL;
+// 呼吸灯状态
 static bool breathing_light_running = false;
 static int original_width = 300;   // 按钮原始宽度
 static int original_height = 300;  // 按钮原始高度
 static int original_x = 30;        // 按钮原始X位置
 static int original_y = 30;        // 按钮原始Y位置
 
-// 呼吸灯任务：让按钮的 opacity 从 100 到 10 循环变化，同时缩放大小
-static void breathing_light_task(void *pvParameters) {
-    const int min_opacity = 10;   // 最小透明度（百分比）
-    const int max_opacity = 100;  // 最大透明度（百分比）
-    const float min_scale = 0.85f;  // 最小缩放比例（85%）
-    const float max_scale = 1.0f;   // 最大缩放比例（100%）
-    const int cycle_ms = 2000;    // 一个完整循环的时间（毫秒）
-    const int update_interval_ms = 50;  // 更新间隔（毫秒）
+// 呼吸灯动画回调：同时改变大小和位置以保持中心点不变
+static void breathing_anim_cb(void * var, int32_t v) {
+    lv_obj_t * obj = (lv_obj_t *)var;
     
-    int direction = -1;  // -1 表示递减，1 表示递增
-    float current_opacity = max_opacity;
+    // v 是当前的宽度/高度 (从 min_size 到 max_size)
+    int new_width = v;
+    int new_height = v;
     
-    while (breathing_light_running) {
-        // 更新透明度
-        if (direction < 0) {
-            current_opacity -= (float)(max_opacity - min_opacity) * update_interval_ms / cycle_ms;
-            if (current_opacity <= min_opacity) {
-                current_opacity = min_opacity;
-                direction = 1;  // 改为递增
-            }
-        } else {
-            current_opacity += (float)(max_opacity - min_opacity) * update_interval_ms / cycle_ms;
-            if (current_opacity >= max_opacity) {
-                current_opacity = max_opacity;
-                direction = -1;  // 改为递减
-            }
-        }
-        
-        // 根据透明度计算缩放比例（透明度高时，大小也大）
-        float opacity_ratio = current_opacity / 100.0f;  // 0.1 到 1.0
-        float scale = min_scale + (max_scale - min_scale) * opacity_ratio;
-        
-        // 设置按钮透明度和大小
-        if (objects.btn_notes_end != NULL) {
-            // // 设置透明度（LVGL 使用 0-255 范围，需要转换）
-            // uint8_t opa_value = (uint8_t)(current_opacity * 255 / 100);
-            // lv_obj_set_style_opa(objects.btn_notes_end, opa_value, LV_PART_MAIN | LV_STATE_DEFAULT);
-            
-            // 设置大小（根据缩放比例）
-            int new_width = (int)(original_width * scale);
-            int new_height = (int)(original_height * scale);
-            lv_obj_set_size(objects.btn_notes_end, new_width, new_height);
-            
-            // 调整位置以保持按钮中心点不变
-            int size_diff_x = original_width - new_width;
-            int size_diff_y = original_height - new_height;
-            int new_x = original_x + size_diff_x / 2;
-            int new_y = original_y + size_diff_y / 2;
-            lv_obj_set_pos(objects.btn_notes_end, new_x, new_y);
-        }
-        
-        vTaskDelay(pdMS_TO_TICKS(update_interval_ms));
-    }
+    // 计算居中位置
+    // 中心点是 (original_x + original_width/2, original_y + original_height/2)
+    // 假设原始是 30, 30, 300, 300 -> 中心是 180, 180
+    int center_x = original_x + original_width / 2;
+    int center_y = original_y + original_height / 2;
     
-    // 恢复原始透明度、大小和位置
-    if (objects.btn_notes_end != NULL) {
-        // lv_obj_set_style_opa(objects.btn_notes_end, LV_OPA_COVER, LV_PART_MAIN | LV_STATE_DEFAULT);
-        lv_obj_set_size(objects.btn_notes_end, original_width, original_height);
-        lv_obj_set_pos(objects.btn_notes_end, original_x, original_y);
-    }
+    int new_x = center_x - new_width / 2;
+    int new_y = center_y - new_height / 2;
     
-    breathing_light_task_handle = NULL;
-    vTaskDelete(NULL);
+    lv_obj_set_size(obj, new_width, new_height);
+    lv_obj_set_pos(obj, new_x, new_y);
 }
 
 // 启动呼吸灯效果
@@ -97,16 +52,36 @@ static void start_breathing_light(void) {
         return;  // 已经在运行
     }
     
-    // 保存按钮的原始大小和位置
     if (objects.btn_notes_end != NULL) {
+        // 保存原始信息
         original_width = lv_obj_get_width(objects.btn_notes_end);
         original_height = lv_obj_get_height(objects.btn_notes_end);
         original_x = lv_obj_get_x(objects.btn_notes_end);
         original_y = lv_obj_get_y(objects.btn_notes_end);
+        
+        // 初始化动画
+        lv_anim_t a;
+        lv_anim_init(&a);
+        lv_anim_set_var(&a, objects.btn_notes_end);
+        
+        // 设置动画参数：从原始大小的 85% 到 100%
+        int32_t min_size = (int32_t)(original_width * 0.85f);
+        int32_t max_size = original_width;
+        
+        lv_anim_set_values(&a, max_size, min_size); // 从大到小
+        lv_anim_set_time(&a, 1000);                 // 半个周期 1秒
+        lv_anim_set_playback_time(&a, 1000);        // 返回时间 1秒
+        lv_anim_set_playback_delay(&a, 0);
+        lv_anim_set_repeat_count(&a, LV_ANIM_REPEAT_INFINITE);
+        lv_anim_set_path_cb(&a, lv_anim_path_ease_in_out); // 平滑的缓动效果
+        
+        // 设置回调函数
+        lv_anim_set_exec_cb(&a, breathing_anim_cb);
+        
+        lv_anim_start(&a);
+        
+        breathing_light_running = true;
     }
-    
-    breathing_light_running = true;
-    xTaskCreate(breathing_light_task, "breathing_light", 2048, NULL, 5, &breathing_light_task_handle);
 }
 
 // 停止呼吸灯效果
@@ -115,12 +90,18 @@ static void stop_breathing_light(void) {
         return;  // 未在运行
     }
     
-    breathing_light_running = false;
-    
-    // 等待任务结束
-    if (breathing_light_task_handle != NULL) {
-        vTaskDelay(pdMS_TO_TICKS(100));
+    if (objects.btn_notes_end != NULL) {
+        // 删除该对象上的所有动画
+        lv_anim_del(objects.btn_notes_end, breathing_anim_cb);
+        
+        // 恢复原始状态
+        lv_obj_set_size(objects.btn_notes_end, original_width, original_height);
+        lv_obj_set_pos(objects.btn_notes_end, original_x, original_y);
+        // 确保透明度也是不透明的（虽然我们没改透明度，但保险起见）
+        lv_obj_set_style_opa(objects.btn_notes_end, LV_OPA_COVER, LV_PART_MAIN | LV_STATE_DEFAULT);
     }
+    
+    breathing_light_running = false;
 }
 
 static void event_handler_cb_main_btn_notes(lv_event_t *e) {

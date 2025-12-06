@@ -28,6 +28,7 @@ uint16_t BLE_Scan(void);
 
 // WiFi状态检查函数
 bool WiFi_IsConnected(void);
+bool WiFi_IsInitComplete(void); // 检查WiFi初始化是否完成
 const char *WiFi_GetError(void);
 
 #ifdef __cplusplus

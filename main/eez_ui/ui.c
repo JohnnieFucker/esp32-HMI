@@ -211,8 +211,10 @@ ActionExecFunc actions[] = {
 // ============================================================================
 static bool wifi_check_started = false;      // WiFi检查是否已启动（在ui_init中设置为true）
 static int wifi_check_timeout = 0;           // WiFi检查超时计数器（每次ui_tick递增）
-#define WIFI_CHECK_TIMEOUT_SEC 30            // WiFi检查超时时间（秒）
+#define WIFI_CHECK_TIMEOUT_SEC 300            // WiFi检查超时时间（秒）- 仅用于初始化完成后的连接超时
                                              // 注意：ui_tick每5ms调用一次，所以超时计数 = 30 * 200 = 6000
+#define WIFI_INIT_TIMEOUT_SEC 600            // WiFi初始化超时时间（秒）- 用于等待WiFi初始化完成
+                                             // 注意：如果WiFi还在初始化中，应该继续等待，而不是超时停止
 
 static bool screen_switch_pending = false;  // 标记屏幕切换是否待处理（用于验证切换是否成功）
 static int screen_switch_verify_count = 0;  // 屏幕切换验证计数（最多验证20次，约100ms）
@@ -312,29 +314,11 @@ void ui_tick() {
     
     // 条件检查：当前屏幕必须是loading屏幕，且WiFi检查已启动
     if (current_screen_id == SCREEN_ID_LOADING && wifi_check_started) {
-        wifi_check_timeout++;  // 每次tick递增（每5ms递增1次）
         
         // 检查WiFi连接状态
         // 注意：WiFi_IsConnected()直接返回事件处理函数中设置的wifi_connected变量
         bool wifi_connected = WiFi_IsConnected();
         const char *error_msg = WiFi_GetError();
-        
-        // 调试信息：每5秒输出一次WiFi状态（可选，已注释）
-        // if (objects.lab_loading != NULL && wifi_check_timeout % 1000 == 0) {
-        //     static char debug_text[256];
-        //     int elapsed_sec = wifi_check_timeout / 200;  // ui_tick每5ms调用一次
-        //     snprintf(debug_text, sizeof(debug_text), 
-        //         "WiFi状态检查\n"
-        //         "超时计数: %d (%d秒)\n"
-        //         "连接状态: %s\n"
-        //         "错误信息: %s\n"
-        //         "当前屏幕ID: %d",
-        //         wifi_check_timeout, elapsed_sec,
-        //         wifi_connected ? "已连接" : "未连接",
-        //         error_msg ? error_msg : "无",
-        //         current_screen_id);
-        //     lv_label_set_text(objects.lab_loading, debug_text);
-        // }
         
         // ====================================================================
         // 情况1: WiFi连接成功，切换到主界面
@@ -342,10 +326,6 @@ void ui_tick() {
         if (wifi_connected) {
             ESP_LOGI("UI", "[ui_tick] ========================================");
             ESP_LOGI("UI", "[ui_tick] WiFi连接成功！准备切换到主界面");
-            ESP_LOGI("UI", "[ui_tick] 当前屏幕ID: %d (LOADING)", current_screen_id);
-            ESP_LOGI("UI", "[ui_tick] 目标屏幕ID: %d (MAIN)", SCREEN_ID_MAIN);
-            ESP_LOGI("UI", "[ui_tick] WiFi检查超时计数: %d (已检查 %d 秒)", 
-                     wifi_check_timeout, wifi_check_timeout / 200);
             
             // 更新UI显示
             if (objects.lab_loading != NULL) {
@@ -380,30 +360,12 @@ void ui_tick() {
             ESP_LOGI("UI", "[ui_tick] ========================================");
             
         // ====================================================================
-        // 情况2: WiFi连接超时（30秒）
+        // 情况2: 检查WiFi连接超时
         // ====================================================================
-        } else if (wifi_check_timeout >= WIFI_CHECK_TIMEOUT_SEC * 200) {
-            // 超时计算：30秒 * 200 (每5ms递增1次) = 6000
-            int elapsed_sec = wifi_check_timeout / 200;
-            ESP_LOGE("UI", "[ui_tick] ========================================");
-            ESP_LOGE("UI", "[ui_tick] ✗ WiFi连接超时！");
-            ESP_LOGE("UI", "[ui_tick] 超时时间: %d 秒 (计数: %d)", elapsed_sec, wifi_check_timeout);
-            ESP_LOGE("UI", "[ui_tick] 错误信息: %s", error_msg ? error_msg : "未知错误");
-            ESP_LOGE("UI", "[ui_tick] 当前屏幕ID: %d", current_screen_id);
-            
-            // 更新UI显示错误信息
-            if (objects.lab_loading != NULL && error_msg != NULL) {
-                static char timeout_text[128];
-                snprintf(timeout_text, sizeof(timeout_text), "%s", error_msg);
-                lv_label_set_text(objects.lab_loading, timeout_text);
-            }
-            
-            // 停止WiFi检查
-            wifi_check_started = false;
-            ESP_LOGE("UI", "[ui_tick] WiFi检查已停止");
-            ESP_LOGE("UI", "[ui_tick] ========================================");
-        }
-        // 情况3: WiFi未连接且未超时 - 继续等待，不执行任何操作
+        // 重要：需要区分两种情况：
+        //   a) WiFi还在初始化中 - 应该继续等待（使用更长的超时时间60秒）
+        //   b) WiFi初始化完成但连接失败 - 应该超时停止（使用较短的超时时间30秒）
+        } 
     }
     
     // ========================================================================

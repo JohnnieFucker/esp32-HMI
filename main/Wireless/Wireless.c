@@ -357,6 +357,11 @@ bool WiFi_IsConnected(void) {
     return wifi_connected;
 }
 
+// 检查WiFi初始化是否完成
+bool WiFi_IsInitComplete(void) {
+    return wifi_init_complete;
+}
+
 // 获取WiFi错误信息
 const char* WiFi_GetError(void) {
     if (wifi_error_msg[0] != '\0') {

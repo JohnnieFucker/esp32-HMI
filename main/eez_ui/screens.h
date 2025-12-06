@@ -16,9 +16,9 @@ typedef struct _objects_t {
     lv_obj_t *obj0;
     lv_obj_t *btn_notes_start;
     lv_obj_t *btn_notes_end;
-    lv_obj_t *btn_notes_start_1;
     lv_obj_t *obj1;
     lv_obj_t *lab_loading;
+    lv_obj_t *btn_notes_start_1;
     lv_obj_t *obj2;
 } objects_t;
 

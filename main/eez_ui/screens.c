@@ -400,7 +400,7 @@ void create_screen_page_notes() {
             lv_obj_add_flag(obj, LV_OBJ_FLAG_HIDDEN);
             lv_obj_set_style_radius(obj, 150, LV_PART_MAIN | LV_STATE_DEFAULT);
             lv_obj_set_style_text_font(obj, &ui_font_chinese_18, LV_PART_MAIN | LV_STATE_DEFAULT);
-            lv_obj_set_style_bg_color(obj, lv_color_hex(0xffc02537), LV_PART_MAIN | LV_STATE_DEFAULT);
+            lv_obj_set_style_bg_color(obj, lv_color_hex(0xff2196f3), LV_PART_MAIN | LV_STATE_DEFAULT);
             {
                 lv_obj_t *parent_obj = obj;
                 {
@@ -447,10 +447,9 @@ void create_screen_page_conf() {
             objects.btn_notes_start_1 = obj;
             lv_obj_set_pos(obj, 130, 130);
             lv_obj_set_size(obj, 100, 100);
-            lv_obj_add_event_cb(obj, event_handler_cb_page_conf_btn_notes_start_1, LV_EVENT_ALL, flowState);
             lv_obj_set_style_radius(obj, 50, LV_PART_MAIN | LV_STATE_DEFAULT);
             lv_obj_set_style_text_font(obj, &ui_font_chinese_18, LV_PART_MAIN | LV_STATE_DEFAULT);
-            lv_obj_set_style_bg_color(obj, lv_color_hex(0xffc02537), LV_PART_MAIN | LV_STATE_DEFAULT);
+            lv_obj_set_style_bg_color(obj, lv_color_hex(0xff2196f3), LV_PART_MAIN | LV_STATE_DEFAULT);
             {
                 lv_obj_t *parent_obj = obj;
                 {

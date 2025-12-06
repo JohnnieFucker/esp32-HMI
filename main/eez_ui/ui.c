@@ -224,7 +224,7 @@ static lv_obj_t *getLvglObjectFromIndex(int32_t index) {
     }
     // 根据索引获取对应的屏幕对象,lvgl对象
     switch (index) {
-        case 0: return objects.screen_loading;
+        case 0: return objects.loading;  // 修正：应该是 loading 而不是 screen_loading
         case 1: return objects.main;
         case 2: return objects.page_notes;
         case 3: return objects.page_conf;
@@ -237,12 +237,21 @@ static int wifi_check_timeout = 0;
 #define WIFI_CHECK_TIMEOUT_SEC 30 // WiFi检查超时时间（秒）
 
 void loadScreen(enum ScreensEnum screenId) {
+    // 修正屏幕ID到索引的映射关系
+    // SCREEN_ID_LOADING (1) -> index 0
+    // SCREEN_ID_MAIN (2) -> index 1
+    // SCREEN_ID_PAGE_NOTES (3) -> index 2
+    // SCREEN_ID_PAGE_CONF (4) -> index 3
     if (screenId == SCREEN_ID_LOADING) {
-        currentScreen = 0;  // Loading是索引0
-    } else if (screenId == SCREEN_ID_ERROR) {
-        currentScreen = 4;  // Error是索引4
+        currentScreen = 0;
+    } else if (screenId == SCREEN_ID_MAIN) {
+        currentScreen = 1;  // 修正：Main应该映射到索引1
+    } else if (screenId == SCREEN_ID_PAGE_NOTES) {
+        currentScreen = 2;  // 修正：page_notes应该映射到索引2
+    } else if (screenId == SCREEN_ID_PAGE_CONF) {
+        currentScreen = 3;  // 修正：page_conf应该映射到索引3
     } else {
-        currentScreen = screenId;  // Main=1, page_notes=2, page_conf=3
+        currentScreen = -1;  // 未知屏幕ID
     }
     current_screen_id = screenId;
     lv_obj_t *screen = getLvglObjectFromIndex(currentScreen);

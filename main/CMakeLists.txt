@@ -19,6 +19,11 @@ idf_component_register(
                               "./PCF85063/PCF85063.c"
                               "./BAT_Driver/BAT_Driver.c"
                               "./Wireless/Wireless.c"
+                              "./Business_Service/NoteService.c"
+                              "./Audio_Recorder/AudioRecorder.c"
+                              "./Http_Client/HttpClient.c"
+                              "./File_System/FileSystem.c"
+                              "./Utils/Utils.c"
                               ${UI_SRCS}
 
                          INCLUDE_DIRS 
@@ -36,6 +41,11 @@ idf_component_register(
                               "./PCF85063"
                               "./BAT_Driver"
                               "./Wireless"
+                              "./Business_Service"
+                              "./Audio_Recorder"
+                              "./Http_Client"
+                              "./File_System"
+                              "./Utils"
                               ${UI_DIR}
                               "."
                          
@@ -48,6 +58,8 @@ idf_component_register(
                               nvs_flash
                               esp_adc
                               esp_wifi
+                              esp_http_client
+                              spiffs
                               bt
                               espressif__esp-sr
                        )

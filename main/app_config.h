@@ -6,12 +6,46 @@
  */
 
 // ==================== WiFi 配置 ====================
-// WiFi 网络连接信息
-#define WIFI_SSID "AP-jianlong"    // 替换为您的 WiFi 名称
-#define WIFI_PASSWORD "1122334455" // 替换为您的 WiFi 密码
+// WiFi 网络连接信息（支持多个 WiFi 网络，按顺序尝试连接）
+typedef struct {
+  const char *ssid;     // WiFi 名称
+  const char *password; // WiFi 密码
+} wifi_config_item_t;
 
-// WiFi 连接超时时间（秒）
-#define WIFI_CONNECT_TIMEOUT_SEC 30
+// WiFi 配置数组大小
+#define WIFI_CONFIG_COUNT 2
+
+// WiFi 配置数组定义
+static const wifi_config_item_t wifi_configs[WIFI_CONFIG_COUNT] = {
+    {"AP-jianlong", "1122334455"}, // 第一个 WiFi 网络
+    {"4F", "yuanhenglizhen"},      // 第二个 WiFi 网络
+};
+
+// WiFi 连接超时时间（秒）- 每个网络尝试连接的时间
+#define WIFI_CONNECT_TIMEOUT_SEC 10
+
+// ==================== 录音配置 ====================
+// 录音时长（秒）
+#define RECORD_DURATION_SEC 60
+
+// 是否启用分块录音模式（当内存不足时自动启用）
+// 分块模式：将长录音分成多个小块，每块录音后立即上传，减少内存占用
+#define RECORD_ENABLE_CHUNK_MODE 1 // 1=启用（自动检测内存），0=禁用
+
+// 分块录音的每块时长（秒），仅在分块模式下有效
+#define RECORD_CHUNK_DURATION_SEC 10
 
 // ==================== 其他配置 ====================
 // 可以在此处添加其他模块的配置参数
+#define CG_TOKEN                                                               \
+  "eyJ0eXBlIjoiSldUIiwiYWxnIjoiSFMyNTYifQ."                                    \
+  "eyJjb21wYW55SWQiOiJmYmQ5NjU0ZS00ZDE5LTRkMjgtYjUyNS1lNzQ3N2E4YjI4YjkiLCJ1c2" \
+  "VySWQiOiIxODYwMjg4MDI3MiIsInVzZXJOYW1lIjoi5p2O5bymIiwibG9naW5UeXBlIjoic21z" \
+  "IiwicGxhdGZvcm0iOiJ3ZWIiLCJpYXQiOjE3NjM2MDAwMjMsImV4cCI6MTc3MTM3NjAyM30._"  \
+  "eO1WGwXfFu0yrwGU54wP3s9Zjj44FvB2OQ9Sj975Zc"
+
+#define USER_ID "18602880272"
+
+#define CG_API_URL "https://vx.cgboiler.com"
+#define API_UPLOAD "/v1/file/upload"
+#define API_NOTE "/v1/note"

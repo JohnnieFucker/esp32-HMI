@@ -10,3 +10,4 @@ __pycache__/
 .vscode/
 .cache/
 managed_components/
+main/app_config.h

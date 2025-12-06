@@ -50,7 +50,9 @@ extern "C" void app_main(void) {
     // raise the task priority of LVGL and/or reduce the handler period can
     // improve the performance
     ui_tick();
-    vTaskDelay(pdMS_TO_TICKS(1));
+    // 增加延迟到5ms，减少刷新频率，降低SPI队列压力
+    // 这样可以避免SPI队列堆积导致的传输失败和花屏问题
+    vTaskDelay(pdMS_TO_TICKS(5));
     // The task running lv_timer_handler should have lower priority than that
     // running `lv_tick_inc`
     lv_timer_handler();

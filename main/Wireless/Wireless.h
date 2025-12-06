@@ -26,6 +26,10 @@ uint16_t WIFI_Scan(void);
 void BLE_Init(void *arg);
 uint16_t BLE_Scan(void);
 
+// WiFi状态检查函数
+bool WiFi_IsConnected(void);
+const char *WiFi_GetError(void);
+
 #ifdef __cplusplus
 }
 #endif

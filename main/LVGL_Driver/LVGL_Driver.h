@@ -1,9 +1,4 @@
 #pragma once
-
-#ifdef __cplusplus
-extern "C" {
-#endif
-
 #include "demos/lv_demos.h"
 #include "esp_err.h"
 #include "esp_log.h"
@@ -32,7 +27,3 @@ void example_increase_lvgl_tick(void *arg);
 
 void LVGL_Init(void); // Call this function to initialize the screen (must be
                       // called in the main function) !!!!!
-
-#ifdef __cplusplus
-}
-#endif

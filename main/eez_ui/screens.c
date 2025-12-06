@@ -60,9 +60,9 @@ static void breathing_light_task(void *pvParameters) {
         
         // 设置按钮透明度和大小
         if (objects.btn_notes_end != NULL) {
-            // 设置透明度（LVGL 使用 0-255 范围，需要转换）
-            uint8_t opa_value = (uint8_t)(current_opacity * 255 / 100);
-            lv_obj_set_style_opa(objects.btn_notes_end, opa_value, LV_PART_MAIN | LV_STATE_DEFAULT);
+            // // 设置透明度（LVGL 使用 0-255 范围，需要转换）
+            // uint8_t opa_value = (uint8_t)(current_opacity * 255 / 100);
+            // lv_obj_set_style_opa(objects.btn_notes_end, opa_value, LV_PART_MAIN | LV_STATE_DEFAULT);
             
             // 设置大小（根据缩放比例）
             int new_width = (int)(original_width * scale);
@@ -82,7 +82,7 @@ static void breathing_light_task(void *pvParameters) {
     
     // 恢复原始透明度、大小和位置
     if (objects.btn_notes_end != NULL) {
-        lv_obj_set_style_opa(objects.btn_notes_end, LV_OPA_COVER, LV_PART_MAIN | LV_STATE_DEFAULT);
+        // lv_obj_set_style_opa(objects.btn_notes_end, LV_OPA_COVER, LV_PART_MAIN | LV_STATE_DEFAULT);
         lv_obj_set_size(objects.btn_notes_end, original_width, original_height);
         lv_obj_set_pos(objects.btn_notes_end, original_x, original_y);
     }

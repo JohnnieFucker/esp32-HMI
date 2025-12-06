@@ -101,6 +101,29 @@ esp_err_t http_client_post_multipart_from_memory(
     size_t response_buffer_size);
 
 /**
+ * 发送HTTP请求（multipart/form-data格式，流式上传，避免文件数据重复占用内存）
+ * @param config 请求配置
+ * @param file_data 要上传的文件数据（内存缓冲区）
+ * @param file_data_size 文件数据大小（字节）
+ * @param file_name 文件名（用于上传）
+ * @param file_field_name 文件字段名（默认为"file"）
+ * @param file_name_field_name 文件名字段名（默认为"fileName"）
+ * @param status_code 输出状态码（可选，传NULL则忽略）
+ * @param response_buffer 响应缓冲区（可选）
+ * @param response_buffer_size 响应缓冲区大小
+ * @return ESP_OK 成功，其他值表示失败
+ *
+ * 注意：此函数使用流式上传，不会将文件数据复制到multipart body中，
+ * 而是直接写入HTTP连接，从而避免文件数据在内存中重复占用。
+ * 内存占用：仅multipart头部和尾部（约200-300字节），而不是文件大小+头部+尾部。
+ */
+esp_err_t http_client_post_multipart_streaming(
+    const http_request_config_t *config, const uint8_t *file_data,
+    size_t file_data_size, const char *file_name, const char *file_field_name,
+    const char *file_name_field_name, int *status_code, char *response_buffer,
+    size_t response_buffer_size);
+
+/**
  * 发送HTTP请求（通用方法）
  * @param config 请求配置
  * @param status_code 输出状态码（可选，传NULL则忽略）

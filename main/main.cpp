@@ -6,6 +6,7 @@
 #include "SD_MMC.h"
 #include "ST77916.h"
 #include "TCA9554PWR.h"
+#include "Utils.h"
 #include "Wireless.h"
 #include "ui.h"
 
@@ -18,6 +19,24 @@ void Driver_Loop(void *parameter) {
   }
   vTaskDelete(NULL);
 }
+
+void MemoryMonitor_Task(void *parameter) {
+  // 等待系统初始化完成
+  vTaskDelay(pdMS_TO_TICKS(2000));
+
+  while (1) {
+    // 每5秒打印一次内存占用情况
+    // 先打印简要信息
+    utils_print_memory_info();
+    // 如果内存紧张，打印详细分解
+    size_t free_internal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    if (free_internal < 100 * 1024) { // 少于100KB时打印详细分解
+      utils_print_memory_breakdown();
+    }
+    vTaskDelay(pdMS_TO_TICKS(5000));
+  }
+  vTaskDelete(NULL);
+}
 void Driver_Init(void) {
   Flash_Searching();
   BAT_Init();
@@ -26,6 +45,9 @@ void Driver_Init(void) {
   PCF85063_Init();
   xTaskCreatePinnedToCore(Driver_Loop, "Other Driver task", 4096, NULL, 3, NULL,
                           0);
+  // 创建内存监控任务，每5秒打印一次内存占用情况
+  xTaskCreatePinnedToCore(MemoryMonitor_Task, "Memory Monitor", 4096, NULL, 1,
+                          NULL, 1);
 }
 extern "C" void app_main(void) {
   Driver_Init();

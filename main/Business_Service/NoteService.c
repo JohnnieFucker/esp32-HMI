@@ -290,11 +290,19 @@ static void record_task(void *pvParameters) {
                     .ssl_verify_mode = HTTP_SSL_VERIFY_NONE,  // 跳过证书验证（开发环境）
                 };
                 
+                // 上传前检查内存状态（HTTPS握手需要约20-40KB内部RAM）
+                size_t free_internal_before = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+                if (free_internal_before < 50 * 1024) {  // 少于50KB
+                    ESP_LOGW(TAG, "分块上传前内存警告：内部RAM仅 %zu KB", free_internal_before / 1024);
+                    utils_print_memory_breakdown();
+                }
+                
                 int status_code = 0;
                 char response_buffer[512] = {0};
-                ret = http_client_post_multipart_from_memory(&upload_config, chunk_buffer, chunk_file_size,
-                                                             filename, "file", "fileName",
-                                                             &status_code, response_buffer, sizeof(response_buffer));
+                // 使用流式上传，避免文件数据重复占用内存
+                ret = http_client_post_multipart_streaming(&upload_config, chunk_buffer, chunk_file_size,
+                                                           filename, "file", "fileName",
+                                                           &status_code, response_buffer, sizeof(response_buffer));
                 
             if (ret == ESP_OK && status_code == 200) {
                 ESP_LOGI(TAG, "块 %d 上传成功，响应: %s", chunk_idx + 1, response_buffer);
@@ -415,6 +423,20 @@ static void record_task(void *pvParameters) {
             char url[512];
             snprintf(url, sizeof(url), "%s%s", CG_API_URL, API_UPLOAD);
             
+            // 上传前检查内存状态（HTTPS握手需要约20-40KB内部RAM）
+            size_t free_internal_before = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+            size_t min_free_before = esp_get_minimum_free_heap_size();
+            ESP_LOGI(TAG, "上传前内存检查 - 内部RAM可用: %zu KB, 历史最小: %zu KB", 
+                     free_internal_before / 1024, min_free_before / 1024);
+            
+            // 如果内部RAM不足，打印详细内存分解
+            if (free_internal_before < 50 * 1024) {  // 少于50KB
+                ESP_LOGW(TAG, "警告：内部RAM不足（%zu KB），HTTPS握手可能需要20-40KB", free_internal_before / 1024);
+                ESP_LOGW(TAG, "打印详细内存占用分解...");
+                // 打印详细内存分解，显示各个组件的占用情况
+                utils_print_memory_breakdown();
+            }
+            
             // 使用HttpClient模块从内存上传
             http_request_config_t upload_config = {
                 .url = url,
@@ -426,9 +448,17 @@ static void record_task(void *pvParameters) {
 
             int status_code = 0;
             char response_buffer[512] = {0};
-            ret = http_client_post_multipart_from_memory(&upload_config, wav_buffer, wav_file_size,
-                                                         filename, "file", "fileName",
-                                                         &status_code, response_buffer, sizeof(response_buffer));
+            // 使用流式上传，避免文件数据重复占用内存
+            // 内存占用：仅multipart头部和尾部（约200-300字节），而不是文件大小+头部+尾部
+            ret = http_client_post_multipart_streaming(&upload_config, wav_buffer, wav_file_size,
+                                                       filename, "file", "fileName",
+                                                       &status_code, response_buffer, sizeof(response_buffer));
+            
+            // 上传后检查内存状态
+            size_t free_internal_after = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+            ESP_LOGI(TAG, "上传后内存检查 - 内部RAM可用: %zu KB (变化: %d KB)", 
+                     free_internal_after / 1024, 
+                     (int)(free_internal_after - free_internal_before) / 1024);
             
             if (ret == ESP_OK && status_code == 200) {
                 ESP_LOGI(TAG, "上传成功，响应: %s", response_buffer);

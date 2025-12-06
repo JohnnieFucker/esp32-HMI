@@ -308,6 +308,219 @@ esp_err_t http_client_post_multipart_from_memory(const http_request_config_t *co
     return ret;
 }
 
+esp_err_t http_client_post_multipart_streaming(const http_request_config_t *config,
+                                                const uint8_t *file_data,
+                                                size_t file_data_size,
+                                                const char *file_name,
+                                                const char *file_field_name,
+                                                const char *file_name_field_name,
+                                                int *status_code,
+                                                char *response_buffer,
+                                                size_t response_buffer_size) {
+    if (config == NULL || config->url == NULL || file_data == NULL || file_name == NULL) {
+        ESP_LOGE(TAG, "配置、URL、文件数据或文件名不能为空");
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    const char *field_name = file_field_name ? file_field_name : "file";
+    const char *name_field_name = file_name_field_name ? file_name_field_name : "fileName";
+
+    // 构建multipart边界
+    char boundary[64] = "----WebKitFormBoundaryzrFQBJBH1leZOl25";
+    char content_type[256];
+    snprintf(content_type, sizeof(content_type), "multipart/form-data; boundary=%s", boundary);
+
+    // 计算multipart头部和尾部大小（不包含文件数据）
+    size_t body_start_size = snprintf(NULL, 0,
+        "--%s\r\n"
+        "Content-Disposition: form-data; name=\"%s\"; filename=\"%s\"\r\n"
+        "Content-Type: audio/wav\r\n"
+        "\r\n",
+        boundary, field_name, file_name);
+    
+    size_t body_end_size = snprintf(NULL, 0,
+        "\r\n--%s\r\n"
+        "Content-Disposition: form-data; name=\"%s\"\r\n"
+        "\r\n"
+        "%s\r\n"
+        "--%s--\r\n",
+        boundary, name_field_name, file_name, boundary);
+    
+    // 总大小（用于Content-Length）
+    size_t total_body_size = body_start_size + file_data_size + body_end_size;
+    
+    ESP_LOGI(TAG, "流式上传: 文件大小 %zu KB, 总body大小 %zu KB (仅头部尾部占用约 %zu 字节内存)",
+             file_data_size / 1024, total_body_size / 1024, body_start_size + body_end_size);
+
+    // 准备响应缓冲区
+    if (response_buffer != NULL && response_buffer_size > 0) {
+        response_buffer[0] = '\0';
+    }
+
+    // 创建HTTP客户端配置（复用http_client_request的逻辑）
+    esp_http_client_config_t client_config = {0};
+    client_config.url = config->url;
+    client_config.method = HTTP_METHOD_POST;
+    client_config.timeout_ms = config->timeout_ms > 0 ? config->timeout_ms : 30000;
+    client_config.event_handler = config->response_cb ? http_event_handler : NULL;
+    client_config.user_data = (void *)config;
+
+    // HTTPS SSL/TLS 配置
+    http_ssl_verify_mode_t verify_mode = config->ssl_verify_mode;
+    if (verify_mode == 0) {
+#if HTTP_CLIENT_CRT_BUNDLE_AVAILABLE
+        verify_mode = HTTP_SSL_VERIFY_CRT_BUNDLE;
+#else
+        verify_mode = HTTP_SSL_VERIFY_NONE;
+#endif
+    }
+    
+    if (verify_mode == HTTP_SSL_VERIFY_NONE) {
+        ESP_LOGW(TAG, "警告：HTTPS证书验证已禁用，连接不安全！");
+        client_config.skip_cert_common_name_check = true;
+        client_config.cert_pem = NULL;
+        client_config.client_cert_pem = NULL;
+        client_config.client_key_pem = NULL;
+        client_config.crt_bundle_attach = NULL;
+#ifdef ESP_HTTP_CLIENT_CONFIG_USE_GLOBAL_CA_STORE
+        client_config.use_global_ca_store = false;
+#endif
+    } else if (verify_mode == HTTP_SSL_VERIFY_CRT_BUNDLE) {
+#if HTTP_CLIENT_CRT_BUNDLE_AVAILABLE
+        client_config.crt_bundle_attach = esp_crt_bundle_attach;
+        ESP_LOGI(TAG, "使用CRT Bundle进行HTTPS证书验证");
+#else
+        ESP_LOGW(TAG, "CRT Bundle不可用，回退到不验证模式");
+        client_config.skip_cert_common_name_check = true;
+#endif
+    }
+
+    // 初始化HTTP客户端
+    esp_http_client_handle_t client = esp_http_client_init(&client_config);
+    if (client == NULL) {
+        ESP_LOGE(TAG, "无法初始化HTTP客户端");
+        return ESP_ERR_NO_MEM;
+    }
+
+    // 设置头部
+    esp_http_client_set_header(client, "Content-Type", content_type);
+    esp_http_client_set_header(client, "Accept", "application/json, text/plain, */*");
+    if (config->token != NULL) {
+        esp_http_client_set_header(client, "token", config->token);
+    }
+    char content_length_str[32];
+    snprintf(content_length_str, sizeof(content_length_str), "%zu", total_body_size);
+    esp_http_client_set_header(client, "Content-Length", content_length_str);
+
+    // 打开连接
+    esp_err_t err = esp_http_client_open(client, total_body_size);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "无法打开HTTP连接: %s", esp_err_to_name(err));
+        esp_http_client_cleanup(client);
+        return err;
+    }
+
+    // 流式写入multipart头部
+    char body_start[512];
+    int start_len = snprintf(body_start, sizeof(body_start),
+        "--%s\r\n"
+        "Content-Disposition: form-data; name=\"%s\"; filename=\"%s\"\r\n"
+        "Content-Type: audio/wav\r\n"
+        "\r\n",
+        boundary, field_name, file_name);
+    
+    int written = esp_http_client_write(client, body_start, start_len);
+    if (written < 0 || written != start_len) {
+        ESP_LOGE(TAG, "写入multipart头部失败: %d", written);
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+        return ESP_FAIL;
+    }
+
+    // 流式写入文件数据（分块写入，避免大块内存操作）
+    const size_t chunk_size = 64 * 1024;  // 64KB块大小
+    size_t remaining = file_data_size;
+    const uint8_t *file_ptr = file_data;
+    
+    while (remaining > 0) {
+        size_t to_write = (remaining > chunk_size) ? chunk_size : remaining;
+        written = esp_http_client_write(client, (const char *)file_ptr, to_write);
+        
+        if (written < 0) {
+            ESP_LOGE(TAG, "写入文件数据失败: %d", written);
+            esp_http_client_close(client);
+            esp_http_client_cleanup(client);
+            return ESP_FAIL;
+        }
+        
+        if (written != (int)to_write) {
+            ESP_LOGW(TAG, "部分写入: 期望 %zu 字节，实际写入 %d 字节", to_write, written);
+        }
+        
+        file_ptr += written;
+        remaining -= written;
+    }
+
+    // 流式写入multipart尾部
+    char body_end[512];
+    int end_len = snprintf(body_end, sizeof(body_end),
+        "\r\n--%s\r\n"
+        "Content-Disposition: form-data; name=\"%s\"\r\n"
+        "\r\n"
+        "%s\r\n"
+        "--%s--\r\n",
+        boundary, name_field_name, file_name, boundary);
+    
+    written = esp_http_client_write(client, body_end, end_len);
+    if (written < 0 || written != end_len) {
+        ESP_LOGE(TAG, "写入multipart尾部失败: %d", written);
+        esp_http_client_close(client);
+        esp_http_client_cleanup(client);
+        return ESP_FAIL;
+    }
+
+    // 完成请求并读取响应
+    err = esp_http_client_fetch_headers(client);
+    if (err == ESP_OK) {
+        int code = esp_http_client_get_status_code(client);
+        int content_length = esp_http_client_get_content_length(client);
+        ESP_LOGI(TAG, "HTTP请求状态码 = %d, 内容长度 = %d", code, content_length);
+        
+        if (status_code != NULL) {
+            *status_code = code;
+        }
+
+        // 读取响应
+        if (response_buffer != NULL && response_buffer_size > 0 && !config->response_cb) {
+            if (content_length > 0) {
+                char *response = (char *)malloc(content_length + 1);
+                if (response != NULL) {
+                    int data_read = esp_http_client_read_response(client, response, content_length);
+                    response[data_read] = '\0';
+                    
+                    if (data_read < (int)response_buffer_size) {
+                        strncpy(response_buffer, response, response_buffer_size - 1);
+                        response_buffer[response_buffer_size - 1] = '\0';
+                    } else {
+                        strncpy(response_buffer, response, response_buffer_size - 1);
+                        response_buffer[response_buffer_size - 1] = '\0';
+                    }
+                    
+                    free(response);
+                }
+            }
+        }
+    } else {
+        ESP_LOGE(TAG, "HTTP请求失败: %s", esp_err_to_name(err));
+    }
+
+    esp_http_client_close(client);
+    esp_http_client_cleanup(client);
+    
+    ESP_LOGI(TAG, "流式上传完成，内存占用仅multipart头部和尾部（约 %zu 字节）", body_start_size + body_end_size);
+    return err;
+}
+
 esp_err_t http_client_request(const http_request_config_t *config,
                               int *status_code,
                               char *response_buffer,
@@ -357,6 +570,10 @@ esp_err_t http_client_request(const http_request_config_t *config,
     client_config.timeout_ms = config->timeout_ms > 0 ? config->timeout_ms : 30000;
     client_config.event_handler = config->response_cb ? http_event_handler : NULL;
     client_config.user_data = (void *)config;
+    
+    // 注意：HTTP头部缓冲区大小通过menuconfig配置项 CONFIG_ESP_HTTP_CLIENT_MAX_HTTP_HEADER_LEN 设置
+    // 默认值为512字节，对于包含长Token的请求可能不够
+    // 建议在 sdkconfig.defaults 中设置：CONFIG_ESP_HTTP_CLIENT_MAX_HTTP_HEADER_LEN=4096
     
     // HTTPS SSL/TLS 配置
     // 根据配置的验证模式设置相应的选项
@@ -452,6 +669,84 @@ esp_err_t http_client_request(const http_request_config_t *config,
     if (config->token != NULL) {
         esp_http_client_set_header(client, "token", config->token);
     }
+
+    // 计算并打印HTTP头部总长度
+    size_t header_total_len = 0;
+    if (config->content_type != NULL) {
+        header_total_len += strlen("Content-Type: ") + strlen(config->content_type) + 2; // +2 for \r\n
+    }
+    header_total_len += strlen("Accept: application/json, text/plain, */*") + 2; // +2 for \r\n
+    if (config->token != NULL) {
+        header_total_len += strlen("token: ") + strlen(config->token) + 2; // +2 for \r\n
+    }
+    // 添加其他可能的头部（Host, User-Agent等由ESP-IDF自动添加）
+    // 估算URL相关的头部
+    if (config->url != NULL) {
+        const char *host_start = strstr(config->url, "://");
+        if (host_start != NULL) {
+            host_start += 3; // 跳过 "://"
+            const char *host_end = strchr(host_start, '/');
+            if (host_end == NULL) {
+                host_end = host_start + strlen(host_start);
+            }
+            size_t host_len = host_end - host_start;
+            header_total_len += strlen("Host: ") + host_len + 2; // +2 for \r\n
+        }
+    }
+    // 估算User-Agent头部（ESP-IDF默认添加）
+    header_total_len += strlen("User-Agent: ESP32 HTTP Client/1.0") + 2; // +2 for \r\n
+    // 如果有请求体，添加Content-Length头部
+    if (config->body != NULL && config->body_len > 0) {
+        char content_length_str[32];
+        snprintf(content_length_str, sizeof(content_length_str), "%zu", config->body_len);
+        header_total_len += strlen("Content-Length: ") + strlen(content_length_str) + 2; // +2 for \r\n
+    }
+    // 添加最后的空行（\r\n）
+    header_total_len += 2;
+    
+    ESP_LOGI(TAG, "========== HTTP头部信息 ==========");
+    ESP_LOGI(TAG, "计算的总头部长度: %zu 字节", header_total_len);
+    if (config->content_type != NULL) {
+        ESP_LOGI(TAG, "  - Content-Type: %zu 字节", strlen("Content-Type: ") + strlen(config->content_type) + 2);
+    }
+    ESP_LOGI(TAG, "  - Accept: %zu 字节", strlen("Accept: application/json, text/plain, */*") + 2);
+    if (config->token != NULL) {
+        ESP_LOGI(TAG, "  - token: %zu 字节", strlen("token: ") + strlen(config->token) + 2);
+    }
+    // 计算其他头部的长度
+    size_t other_headers_len = header_total_len;
+    if (config->content_type != NULL) {
+        other_headers_len -= (strlen("Content-Type: ") + strlen(config->content_type) + 2);
+    }
+    other_headers_len -= (strlen("Accept: application/json, text/plain, */*") + 2);
+    if (config->token != NULL) {
+        other_headers_len -= (strlen("token: ") + strlen(config->token) + 2);
+    }
+    other_headers_len -= 2; // 最后的空行
+    ESP_LOGI(TAG, "  - 其他头部（Host, User-Agent, Content-Length等）: 约 %zu 字节", other_headers_len);
+    // 尝试获取配置的缓冲区大小（如果宏已定义）
+    #if defined(CONFIG_ESP_HTTP_CLIENT_MAX_HTTP_HEADER_LEN)
+    int configured_buffer_size = CONFIG_ESP_HTTP_CLIENT_MAX_HTTP_HEADER_LEN;
+    ESP_LOGI(TAG, "当前配置的缓冲区大小: %d 字节 (通过 CONFIG_ESP_HTTP_CLIENT_MAX_HTTP_HEADER_LEN 设置)", 
+             configured_buffer_size);
+    if (header_total_len > configured_buffer_size) {
+        ESP_LOGW(TAG, "警告：计算的头部长度 (%zu) 超过配置的缓冲区大小 (%d)，建议增加 CONFIG_ESP_HTTP_CLIENT_MAX_HTTP_HEADER_LEN", 
+                 header_total_len, configured_buffer_size);
+    }
+    #elif defined(CONFIG_ESP_HTTP_CLIENT_MAX_HEADER_LEN)
+    int configured_buffer_size = CONFIG_ESP_HTTP_CLIENT_MAX_HEADER_LEN;
+    ESP_LOGI(TAG, "当前配置的缓冲区大小: %d 字节 (通过 CONFIG_ESP_HTTP_CLIENT_MAX_HEADER_LEN 设置)", 
+             configured_buffer_size);
+    if (header_total_len > configured_buffer_size) {
+        ESP_LOGW(TAG, "警告：计算的头部长度 (%zu) 超过配置的缓冲区大小 (%d)，建议增加配置值", 
+                 header_total_len, configured_buffer_size);
+    }
+    #else
+    ESP_LOGI(TAG, "注意：无法读取 HTTP 头部缓冲区配置，请检查 sdkconfig 配置");
+    ESP_LOGI(TAG, "建议在 sdkconfig 或 sdkconfig.defaults 中设置: CONFIG_ESP_HTTP_CLIENT_MAX_HTTP_HEADER_LEN=%zu", 
+             header_total_len + 512); // 建议值：实际长度 + 512字节余量
+    #endif
+    ESP_LOGI(TAG, "==================================");
 
     // 设置请求体
     if (config->body != NULL && config->body_len > 0) {

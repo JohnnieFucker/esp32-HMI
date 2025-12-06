@@ -164,32 +164,11 @@ static void record_task(void *pvParameters) {
             }
         }
         
-        // 如果内存分配失败，尝试分块录音模式
+        // 如果内存分配失败，强制使用分块录音模式
         bool use_chunk_mode = false;
         if (wav_buffer == NULL) {
-            #if RECORD_ENABLE_CHUNK_MODE
-            // 计算分块模式需要的缓冲区大小
-            int samples_per_chunk = RECORD_SAMPLE_RATE * RECORD_CHUNK_DURATION_SEC;
-            size_t chunk_audio_size = samples_per_chunk * bytes_per_sample;
-            size_t chunk_buffer_size = wav_header_size + chunk_audio_size;
-            
-            // 检查分块模式是否有足够内存
-            if (free_spiram >= chunk_buffer_size || free_heap >= chunk_buffer_size) {
-                ESP_LOGW(TAG, "内存不足，自动切换到分块录音模式（每块 %d 秒）", RECORD_CHUNK_DURATION_SEC);
-                use_chunk_mode = true;
-            } else {
-                ESP_LOGE(TAG, "无法分配内存缓冲区 (%d KB)，分块模式也需要 %d KB，可用内存不足", 
-                         total_buffer_size / 1024, chunk_buffer_size / 1024);
-                ESP_LOGE(TAG, "建议：1. 检查PSRAM是否启用 2. 减少录音时长或分块时长");
-                vTaskDelay(pdMS_TO_TICKS(1000));
-                continue;
-            }
-            #else
-            ESP_LOGE(TAG, "无法分配内存缓冲区 (%d KB)，可用内存不足", total_buffer_size / 1024);
-            ESP_LOGE(TAG, "建议：1. 检查PSRAM是否启用 2. 减少录音时长 3. 启用分块录音模式");
-            vTaskDelay(pdMS_TO_TICKS(1000));
-            continue;
-            #endif
+             ESP_LOGW(TAG, "内存不足，强制切换到分块录音模式");
+             use_chunk_mode = true;
         }
         
         if (use_chunk_mode) {

@@ -87,9 +87,21 @@ void LVGL_Init(void)
     ESP_LOGI(TAG_LVGL, "Initialize LVGL library");
     lv_init();
     
+    size_t free_spiram = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    ESP_LOGI(TAG_LVGL, "Free SPIRAM: %d bytes", free_spiram);
+
     lv_color_t *buf1 = heap_caps_malloc(LVGL_BUF_LEN * sizeof(lv_color_t), MALLOC_CAP_SPIRAM);
+    if (!buf1) {
+        ESP_LOGE(TAG_LVGL, "Failed to allocate display buffer 1 in SPIRAM! Trying Internal RAM...");
+        buf1 = heap_caps_malloc(LVGL_BUF_LEN * sizeof(lv_color_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+    }
     assert(buf1);
+    
     lv_color_t *buf2 = heap_caps_malloc(LVGL_BUF_LEN * sizeof(lv_color_t) , MALLOC_CAP_SPIRAM);    
+    if (!buf2) {
+        ESP_LOGE(TAG_LVGL, "Failed to allocate display buffer 2 in SPIRAM! Trying Internal RAM...");
+        buf2 = heap_caps_malloc(LVGL_BUF_LEN * sizeof(lv_color_t), MALLOC_CAP_INTERNAL | MALLOC_CAP_DMA);
+    }
     assert(buf2);
     lv_disp_draw_buf_init(&disp_buf, buf1, buf2, LVGL_BUF_LEN);                              // initialize LVGL draw buffers
 

@@ -60,7 +60,6 @@ idf_component_register(
                               esp_wifi
                               esp_http_client
                               spiffs
-                              bt
                               espressif__esp-sr
                        )
 

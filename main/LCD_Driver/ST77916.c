@@ -208,12 +208,34 @@ void LCD_Init() {
   Touch_Init();
 }
 
+// ============================================================================
+// 测试绘制函数（初始化时绘制测试图案）
+// ============================================================================
+// 功能：在LCD初始化后绘制测试图案，用于验证LCD是否正常工作
+// 注意：此函数可能会传输大量数据，如果超过max_transfer_sz限制，也可能导致花屏
+// 如果不需要测试图案，可以注释掉此函数的调用
 static void test_draw_bitmap(esp_lcd_panel_handle_t panel_handle)
 {
+  ESP_LOGI(TAG_LCD, "绘制LCD测试图案...");
+  
   uint16_t row_line = ((EXAMPLE_LCD_WIDTH / EXAMPLE_LCD_COLOR_BITS) << 1) >> 1;
   uint8_t byte_per_pixel = EXAMPLE_LCD_COLOR_BITS / 8;
-  uint8_t *color = (uint8_t *)heap_caps_calloc(1, row_line * EXAMPLE_LCD_HEIGHT * byte_per_pixel, MALLOC_CAP_DMA);
-
+  size_t buffer_size = row_line * EXAMPLE_LCD_HEIGHT * byte_per_pixel;
+  
+  ESP_LOGI(TAG_LCD, "测试图案缓冲区大小: %zu 字节 (%zu KB)", buffer_size, buffer_size / 1024);
+  
+  // 检查缓冲区大小是否超过传输限制
+  if (buffer_size > ESP_PANEL_HOST_SPI_MAX_TRANSFER_SIZE) {
+    ESP_LOGW(TAG_LCD, "⚠️  测试图案缓冲区过大: %zu 字节 (限制: %d 字节)", 
+             buffer_size, ESP_PANEL_HOST_SPI_MAX_TRANSFER_SIZE);
+    ESP_LOGW(TAG_LCD, "  这可能导致测试图案绘制失败或花屏");
+  }
+  
+  uint8_t *color = (uint8_t *)heap_caps_calloc(1, buffer_size, MALLOC_CAP_DMA);
+  if (color == NULL) {
+    ESP_LOGE(TAG_LCD, "无法分配测试图案缓冲区内存");
+    return;
+  }
 
   for (int j = 0; j < EXAMPLE_LCD_COLOR_BITS; j++) {
       for (int i = 0; i < row_line * EXAMPLE_LCD_HEIGHT; i++) {
@@ -221,38 +243,72 @@ static void test_draw_bitmap(esp_lcd_panel_handle_t panel_handle)
               color[i * byte_per_pixel + k] = (SPI_SWAP_DATA_TX(BIT(j), EXAMPLE_LCD_COLOR_BITS) >> (k * 8)) & 0xff;
           }
       }
-      esp_lcd_panel_draw_bitmap(panel_handle, 0, j * row_line, EXAMPLE_LCD_HEIGHT, (j + 1) * row_line, color);
+      
+      int y_start = j * row_line;
+      int y_end = (j + 1) * row_line;
+      size_t chunk_size = row_line * byte_per_pixel;
+      
+      ESP_LOGD(TAG_LCD, "绘制测试图案块 %d: 区域 (0,%d) -> (%d,%d), 大小: %zu 字节", 
+               j, y_start, EXAMPLE_LCD_HEIGHT - 1, y_end - 1, chunk_size);
+      
+      esp_err_t ret = esp_lcd_panel_draw_bitmap(panel_handle, 0, y_start, EXAMPLE_LCD_HEIGHT, y_end, color);
+      if (ret != ESP_OK) {
+        ESP_LOGW(TAG_LCD, "测试图案绘制失败 [块%d]: %s", j, esp_err_to_name(ret));
+      }
   }
   free(color);
+  ESP_LOGI(TAG_LCD, "✓ 测试图案绘制完成");
 }
 
+// ============================================================================
+// QSPI初始化函数
+// ============================================================================
+// 功能：初始化QSPI总线并配置LCD面板
+// 重要配置说明：
+//   1. max_transfer_sz: 必须足够大以容纳一次完整的屏幕刷新数据
+//      对于360x360 16位色屏幕，建议至少64KB
+//   2. SPI频率: 在QSPI模式下，建议使用20-40MHz，过高可能导致传输错误
+//   3. trans_queue_depth: 增大队列深度可以避免队列溢出
 int QSPI_Init(void){
+  // ========================================================================
+  // SPI总线配置
+  // ========================================================================
   static const spi_bus_config_t host_config = {            
-    .data0_io_num = ESP_PANEL_LCD_SPI_IO_DATA0,                    
-    .data1_io_num = ESP_PANEL_LCD_SPI_IO_DATA1,                   
-    .sclk_io_num = ESP_PANEL_LCD_SPI_IO_SCK,                   
-    .data2_io_num = ESP_PANEL_LCD_SPI_IO_DATA2,                    
-    .data3_io_num = ESP_PANEL_LCD_SPI_IO_DATA3,                    
-    .data4_io_num = -1,                       
-    .data5_io_num = -1,                      
-    .data6_io_num = -1,                       
-    .data7_io_num = -1,                      
-    .max_transfer_sz = ESP_PANEL_HOST_SPI_MAX_TRANSFER_SIZE, 
-    .flags = SPICOMMON_BUSFLAG_MASTER,       
-    .intr_flags = 0,                            
+    .data0_io_num = ESP_PANEL_LCD_SPI_IO_DATA0,      // QSPI数据线0（MOSI）                  
+    .data1_io_num = ESP_PANEL_LCD_SPI_IO_DATA1,      // QSPI数据线1                  
+    .sclk_io_num = ESP_PANEL_LCD_SPI_IO_SCK,         // SPI时钟线                  
+    .data2_io_num = ESP_PANEL_LCD_SPI_IO_DATA2,      // QSPI数据线2                  
+    .data3_io_num = ESP_PANEL_LCD_SPI_IO_DATA3,      // QSPI数据线3                  
+    .data4_io_num = -1,                               // 未使用（8线模式）                      
+    .data5_io_num = -1,                               // 未使用（8线模式）                      
+    .data6_io_num = -1,                               // 未使用（8线模式）                      
+    .data7_io_num = -1,                               // 未使用（8线模式）                      
+    .max_transfer_sz = ESP_PANEL_HOST_SPI_MAX_TRANSFER_SIZE,  // 最大传输大小（已增大到64KB）
+    .flags = SPICOMMON_BUSFLAG_MASTER,               // 主模式       
+    .intr_flags = 0,                                 // 不使用中断                            
   };
-  if(spi_bus_initialize(ESP_PANEL_HOST_SPI_ID_DEFAULT, &host_config, SPI_DMA_CH_AUTO) != ESP_OK){
-    printf("The SPI initialization failed.\r\n");
+  
+  ESP_LOGI(TAG_LCD, "初始化QSPI总线...");
+  ESP_LOGI(TAG_LCD, "  - 最大传输大小: %d 字节 (%d KB)", 
+           ESP_PANEL_HOST_SPI_MAX_TRANSFER_SIZE, ESP_PANEL_HOST_SPI_MAX_TRANSFER_SIZE / 1024);
+  esp_err_t ret = spi_bus_initialize(ESP_PANEL_HOST_SPI_ID_DEFAULT, &host_config, SPI_DMA_CH_AUTO);
+  if(ret != ESP_OK){
+    ESP_LOGE(TAG_LCD, "SPI总线初始化失败: %s", esp_err_to_name(ret));
     return 0;
   }
-  printf("The SPI initialization succeeded.\r\n");
+  ESP_LOGI(TAG_LCD, "✓ SPI总线初始化成功");
   
+  // ============================================================================
+  // SPI IO配置
+  // ============================================================================
+  // 注意：直接使用正常操作频率，不要删除和重新创建io_handle
+  // 删除io_handle会导致后续创建的panel_handle失效，导致花屏
   esp_lcd_panel_io_spi_config_t io_config ={
     .cs_gpio_num = ESP_PANEL_LCD_SPI_IO_CS,               
     .dc_gpio_num = -1,                  
     .spi_mode = ESP_PANEL_LCD_SPI_MODE,                     
-    .pclk_hz = 3 * 1000 * 1000,   
-    .trans_queue_depth = ESP_PANEL_LCD_SPI_TRANS_QUEUE_SZ,            
+    .pclk_hz = ESP_PANEL_LCD_SPI_CLK_HZ,  // 直接使用正常操作频率
+    .trans_queue_depth = ESP_PANEL_LCD_SPI_TRANS_QUEUE_SZ,  // 增大队列深度
     .on_color_trans_done = NULL,                            
     .user_ctx = NULL,                   
     .lcd_cmd_bits = ESP_PANEL_LCD_SPI_CMD_BITS,                 
@@ -260,59 +316,62 @@ int QSPI_Init(void){
     .flags = {                          
       .dc_low_on_data = 0,            
       .octal_mode = 0,                
-      .quad_mode = 1,                 
+      .quad_mode = 1,                 // QSPI模式（4线）
       .sio_mode = 0,                  
       .lsb_first = 0,                 
       .cs_high_active = 0,            
     },                                  
   };
+  
+  ESP_LOGI(TAG_LCD, "配置LCD SPI参数:");
+  ESP_LOGI(TAG_LCD, "  - SPI频率: %d MHz", ESP_PANEL_LCD_SPI_CLK_HZ / 1000000);
+  ESP_LOGI(TAG_LCD, "  - 最大传输大小: %d 字节 (%d KB)", 
+           ESP_PANEL_HOST_SPI_MAX_TRANSFER_SIZE, ESP_PANEL_HOST_SPI_MAX_TRANSFER_SIZE / 1024);
+  ESP_LOGI(TAG_LCD, "  - 传输队列深度: %d", ESP_PANEL_LCD_SPI_TRANS_QUEUE_SZ);
+  
   esp_lcd_panel_io_handle_t io_handle = NULL;
   if(esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)ESP_PANEL_HOST_SPI_ID_DEFAULT, &io_config, &io_handle) != ESP_OK){
-    printf("Failed to set LCD communication parameters -- SPI\r\n");
+    ESP_LOGE(TAG_LCD, "Failed to set LCD communication parameters -- SPI");
     return 0;
   }
-  printf("LCD communication parameters are set successfully -- SPI\r\n");
+  ESP_LOGI(TAG_LCD, "✓ LCD SPI IO配置成功");
 
-  printf("Install LCD driver of st77916\r\n");
-  st77916_vendor_config_t vendor_config={  
-    .flags = {
-      .use_qspi_interface = 1,
-    },
-  };
-  printf("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\r\n");
-  esp_err_t ret;
+  ESP_LOGI(TAG_LCD, "读取LCD芯片ID寄存器...");
   int lcd_cmd = 0x04;
   uint8_t register_data[4]; 
   size_t param_size = sizeof(register_data);
   lcd_cmd &= 0xff;
   lcd_cmd <<= 8;
   lcd_cmd |= LCD_OPCODE_READ_CMD << 24;  // Use the read opcode instead of write
-  ret = esp_lcd_panel_io_rx_param(io_handle, lcd_cmd, register_data, param_size); 
+  ret = esp_lcd_panel_io_rx_param(io_handle, lcd_cmd, register_data, param_size);
   if (ret == ESP_OK) {
-    printf("Register 0x04 data: %02x %02x %02x %02x\n", register_data[0], register_data[1], register_data[2], register_data[3]);
+    ESP_LOGI(TAG_LCD, "Register 0x04 data: %02x %02x %02x %02x", 
+             register_data[0], register_data[1], register_data[2], register_data[3]);
   } else {
-    printf("Failed to read register 0x04, error code: %d\n", ret);
-  } 
-  // panel_io_spi_del(io_handle);
-  io_config.pclk_hz = ESP_PANEL_LCD_SPI_CLK_HZ;
-  if(esp_lcd_new_panel_io_spi((esp_lcd_spi_bus_handle_t)ESP_PANEL_HOST_SPI_ID_DEFAULT, &io_config, &io_handle) != ESP_OK){
-    printf("Failed to set LCD communication parameters -- SPI\r\n");
-    return 0;
+    ESP_LOGW(TAG_LCD, "Failed to read register 0x04, error code: %d", ret);
   }
-  printf("LCD communication parameters are set successfully -- SPI\r\n");
   
-  // Check register values and configure accordingly
+  // ============================================================================
+  // 配置LCD面板供应商配置
+  // ============================================================================
+  ESP_LOGI(TAG_LCD, "配置LCD面板供应商参数...");
+  st77916_vendor_config_t vendor_config={  
+    .flags = {
+      .use_qspi_interface = 1,
+    },
+  };
+  
+  // 根据读取的寄存器值选择初始化命令
   if (register_data[0] == 0x00 && register_data[1] == 0x7F && register_data[2] == 0x7F && register_data[3] == 0x7F) {
     // Handle the case where the register data matches this pattern
-    printf("Vendor-specific initialization for case 1.\n");
+    ESP_LOGI(TAG_LCD, "使用供应商初始化方案1");
   }
   else if (register_data[0] == 0x00 && register_data[1] == 0x02 && register_data[2] == 0x7F && register_data[3] == 0x7F) {
     // Provide vendor-specific initialization commands if register data matches this pattern
     vendor_config.init_cmds = vendor_specific_init_new;
     vendor_config.init_cmds_size = sizeof(vendor_specific_init_new) / sizeof(st77916_lcd_init_cmd_t);
-    printf("Vendor-specific initialization for case 2.\n");
+    ESP_LOGI(TAG_LCD, "使用供应商初始化方案2");
   }
-  printf("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\r\n");
  
 
   esp_lcd_panel_dev_config_t panel_config={

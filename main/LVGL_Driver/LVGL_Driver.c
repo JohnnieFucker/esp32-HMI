@@ -1,5 +1,5 @@
 #include "LVGL_Driver.h"
-#include "freertos/FreeRTOS.h"
+#include "ST77916.h"  // 包含SPI配置宏定义
 #include "freertos/task.h"
 
 static const char *TAG_LVGL = "LVGL";
@@ -14,6 +14,20 @@ void example_increase_lvgl_tick(void *arg)
     lv_tick_inc(EXAMPLE_LVGL_TICK_PERIOD_MS);
 }
 
+// ============================================================================
+// LVGL显示刷新回调函数
+// ============================================================================
+// 功能：将LVGL绘制缓冲区的内容传输到LCD屏幕
+// 重要说明：
+//   1. 此函数在LVGL需要刷新屏幕时被调用
+//   2. 必须尽快完成并调用lv_disp_flush_ready()，否则会阻塞LVGL
+//   3. 如果传输失败，仍然要通知LVGL继续，避免死锁
+//   4. 不要在此函数中添加延迟，会导致SPI队列堆积
+// 
+// 参数：
+//   - drv: LVGL显示驱动指针
+//   - area: 需要刷新的屏幕区域
+//   - color_map: 颜色数据缓冲区
 void example_lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *color_map)
 {
     esp_lcd_panel_handle_t panel_handle = (esp_lcd_panel_handle_t) drv->user_data;
@@ -22,18 +36,121 @@ void example_lvgl_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t
     int offsety1 = area->y1;
     int offsety2 = area->y2;
     
-    // copy a buffer's content to a specific area of the display
+    // 计算传输的数据大小（用于调试）
+    int width = offsetx2 - offsetx1 + 1;
+    int height = offsety2 - offsety1 + 1;
+    size_t data_size = width * height * sizeof(lv_color_t);
+    
+    // 详细日志：说明正在传输什么数据
+    ESP_LOGD(TAG_LVGL, "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    ESP_LOGD(TAG_LVGL, "LVGL刷新回调: 传输屏幕区域数据");
+    ESP_LOGD(TAG_LVGL, "  区域: (%d,%d) -> (%d,%d)", offsetx1, offsety1, offsetx2, offsety2);
+    ESP_LOGD(TAG_LVGL, "  尺寸: %d x %d 像素", width, height);
+    ESP_LOGD(TAG_LVGL, "  数据大小: %zu 字节 (%zu KB)", data_size, data_size / 1024);
+    ESP_LOGD(TAG_LVGL, "  最大限制: %d 字节 (%d KB)", 
+             ESP_PANEL_HOST_SPI_MAX_TRANSFER_SIZE, ESP_PANEL_HOST_SPI_MAX_TRANSFER_SIZE / 1024);
+    ESP_LOGD(TAG_LVGL, "  数据来源: LVGL绘制缓冲区 (color_map指针: %p)", (void*)color_map);
+    
+    // 检查数据大小是否超过最大传输限制
+    // 如果超过，需要手动分块传输
+    // 注意：即使ESP-LCD声称支持自动分块，实际测试中发现可能不会自动分块
+    // 所以我们需要手动实现分块传输以确保稳定性
+    if (data_size > ESP_PANEL_HOST_SPI_MAX_TRANSFER_SIZE) {
+        ESP_LOGW(TAG_LVGL, "⚠️  数据超过限制，需要分块传输");
+        ESP_LOGW(TAG_LVGL, "  超过: %zu 字节 (限制: %d 字节)", 
+                 data_size - ESP_PANEL_HOST_SPI_MAX_TRANSFER_SIZE, ESP_PANEL_HOST_SPI_MAX_TRANSFER_SIZE);
+        
+        // 手动分块传输：按行分块
+        // 计算每块的最大高度（以字节为单位，留一些余量）
+        size_t max_bytes_per_chunk = ESP_PANEL_HOST_SPI_MAX_TRANSFER_SIZE - 1024;  // 留1KB余量
+        int max_height_per_chunk = max_bytes_per_chunk / (width * sizeof(lv_color_t));
+        if (max_height_per_chunk < 1) {
+            max_height_per_chunk = 1;  // 至少传输一行
+        }
+        
+        int total_chunks = (height + max_height_per_chunk - 1) / max_height_per_chunk;
+        ESP_LOGI(TAG_LVGL, "开始分块传输: %zu 字节 -> %d 块 (每块最多 %d 行, %zu 字节)", 
+                 data_size, total_chunks, max_height_per_chunk, max_bytes_per_chunk);
+        
+        esp_err_t ret = ESP_OK;
+        int current_y = offsety1;
+        int chunk_index = 0;
+        bool has_error = false;
+        
+        while (current_y <= offsety2) {
+            // 计算当前块的高度
+            int chunk_height = (current_y + max_height_per_chunk <= offsety2) ? 
+                              max_height_per_chunk : (offsety2 - current_y + 1);
+            int chunk_y_end = current_y + chunk_height - 1;
+            
+            // 计算当前块的数据指针偏移
+            int y_offset = current_y - offsety1;
+            lv_color_t *chunk_data = color_map + (y_offset * width);
+            
+            // 传输当前块
+            size_t chunk_data_size = chunk_height * width * sizeof(lv_color_t);
+            ESP_LOGD(TAG_LVGL, "  传输块 [%d/%d]: 区域 (%d,%d) -> (%d,%d), 大小: %zu 字节 (%d 行)", 
+                     chunk_index + 1, total_chunks, offsetx1, current_y, offsetx2, chunk_y_end,
+                     chunk_data_size, chunk_height);
+            
+            ret = esp_lcd_panel_draw_bitmap(panel_handle, offsetx1, current_y, offsetx2 + 1, chunk_y_end + 1, chunk_data);
+            
+            if (ret != ESP_OK) {
+                has_error = true;
+                ESP_LOGW(TAG_LVGL, "  ✗ 分块传输失败 [块%d/%d]: %s", 
+                         chunk_index + 1, total_chunks, esp_err_to_name(ret));
+                ESP_LOGW(TAG_LVGL, "     区域: (%d,%d) -> (%d,%d), 大小: %zu 字节", 
+                         offsetx1, current_y, offsetx2, chunk_y_end, chunk_data_size);
+                // 即使失败也继续传输下一块，避免整个屏幕卡死
+            } else {
+                ESP_LOGD(TAG_LVGL, "  ✓ 块 [%d/%d] 传输成功", chunk_index + 1, total_chunks);
+            }
+            
+            current_y += chunk_height;
+            chunk_index++;
+        }
+        
+        // 记录分块传输结果
+        if (!has_error) {
+            ESP_LOGI(TAG_LVGL, "✓ 分块传输完成: %d 块全部成功", chunk_index);
+        } else {
+            ESP_LOGW(TAG_LVGL, "✗ 分块传输部分失败: %d 块中有错误", chunk_index);
+        }
+        ESP_LOGD(TAG_LVGL, "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+        
+        // 无论成功或失败，都通知LVGL继续
+        lv_disp_flush_ready(drv);
+        return;
+    }
+    
+    // 数据大小在限制内，直接传输
+    ESP_LOGD(TAG_LVGL, "数据在限制内，直接传输");
+    // 将缓冲区内容复制到显示器的指定区域
+    // 注意：esp_lcd_panel_draw_bitmap是异步的，会立即返回
     esp_err_t ret = esp_lcd_panel_draw_bitmap(panel_handle, offsetx1, offsety1, offsetx2 + 1, offsety2 + 1, color_map);
     
     // 如果传输失败，记录错误但不阻塞（避免死锁）
     if (ret != ESP_OK) {
-        ESP_LOGW(TAG_LVGL, "LCD绘制失败: %s (区域: %d,%d -> %d,%d)", esp_err_to_name(ret), offsetx1, offsety1, offsetx2, offsety2);
+        // 只记录警告，不阻塞LVGL
+        // 频繁的错误日志可能会影响性能，所以使用LOGW级别
+        ESP_LOGW(TAG_LVGL, "✗ LCD绘制失败: %s", esp_err_to_name(ret));
+        ESP_LOGW(TAG_LVGL, "  区域: %d,%d -> %d,%d (大小: %dx%d, 数据: %zu 字节)", 
+                 offsetx1, offsety1, offsetx2, offsety2, width, height, data_size);
+        ESP_LOGW(TAG_LVGL, "  可能原因: 1) SPI队列满 2) 传输数据过大 3) SPI频率过高 4) 硬件连接问题");
         // 即使失败也通知LVGL继续，避免卡死
+        // 如果频繁失败，可能需要：
+        //   1. 降低SPI频率
+        //   2. 增大max_transfer_sz
+        //   3. 增大trans_queue_depth
+        //   4. 检查硬件连接
+    } else {
+        ESP_LOGD(TAG_LVGL, "✓ 传输成功");
     }
+    ESP_LOGD(TAG_LVGL, "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     
-    // 移除延迟，让LVGL立即继续处理下一帧
-    // 延迟会导致SPI队列堆积，造成传输失败
-    // 通知 LVGL 刷新完成
+    // 重要：必须立即通知LVGL刷新完成，不要添加任何延迟
+    // 延迟会导致SPI队列堆积，造成更多传输失败
+    // 即使传输失败，也要通知LVGL继续，避免整个UI卡死
     lv_disp_flush_ready(drv);
 }
 

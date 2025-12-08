@@ -7,7 +7,7 @@
 #include "images.h"
 #include "actions.h"
 #include "vars.h"
-#include "Wireless.h"
+#include "wifi_service.h"
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"

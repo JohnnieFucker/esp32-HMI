@@ -11,3 +11,4 @@ __pycache__/
 .cache/
 managed_components/
 main/app_config.h
+koi_esp32/

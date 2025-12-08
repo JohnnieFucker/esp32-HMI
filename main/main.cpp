@@ -1,82 +1,118 @@
-#include "BAT_Driver.h"
-#include "LVGL_Example.h"
-#include "MIC_Speech.h"
-#include "PCF85063.h"
-#include "PCM5101.h"
-#include "SD_MMC.h"
-#include "ST77916.h"
-#include "TCA9554PWR.h"
-#include "Utils.h"
-#include "Wireless.h"
-#include "ui.h"
+/**
+ * @file main.cpp
+ * @brief ESP32-HMI 主程序入口
+ *
+ * 系统启动流程：
+ * 1. 初始化基础驱动（I2C、GPIO扩展、RTC、电池）
+ * 2. 初始化显示系统（LCD、背光、触摸）
+ * 3. 初始化音频系统（I2S、音频播放器）
+ * 4. 初始化 LVGL 图形库和 UI
+ * 5. 进入主循环处理 UI 事件
+ */
 
-void Driver_Loop(void *parameter) {
+#include "bat_driver.h"
+#include "lvgl.h"
+#include "lvgl_driver.h"
+#include "pcf85063.h"
+#include "pcm5101.h"
+#include "st77916.h"
+#include "tca9554.h"
+#include "ui.h"
+#include "utils.h"
+#include "wifi_service.h"
+
+#include "esp_heap_caps.h"
+
+// ============================================================================
+// 任务函数
+// ============================================================================
+
+/**
+ * @brief 后台驱动任务
+ *
+ * 负责处理：
+ * - WiFi 连接管理
+ * - RTC 时间更新
+ * - 电池电压监测
+ */
+static void driver_task(void *parameter) {
   Wireless_Init();
+
   while (1) {
     PCF85063_Loop();
     BAT_Get_Volts();
     vTaskDelay(pdMS_TO_TICKS(100));
   }
+
   vTaskDelete(NULL);
 }
 
-void MemoryMonitor_Task(void *parameter) {
+/**
+ * @brief 内存监控任务
+ *
+ * 定期打印内存使用情况，用于调试和内存优化
+ */
+static void memory_monitor_task(void *parameter) {
   // 等待系统初始化完成
   vTaskDelay(pdMS_TO_TICKS(2000));
 
   while (1) {
-    // 每5秒打印一次内存占用情况
-    // 先打印简要信息
     utils_print_memory_info();
-    // 如果内存紧张，打印详细分解
+
+    // 内存紧张时打印详细分解
     size_t free_internal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
-    if (free_internal < 100 * 1024) { // 少于100KB时打印详细分解
+    if (free_internal < 100 * 1024) {
       utils_print_memory_breakdown();
     }
+
     vTaskDelay(pdMS_TO_TICKS(5000));
   }
+
   vTaskDelete(NULL);
 }
-void Driver_Init(void) {
-  Flash_Searching();
-  BAT_Init();
-  I2C_Init();
-  EXIO_Init(); // Example Initialize EXIO
-  PCF85063_Init();
-  xTaskCreatePinnedToCore(Driver_Loop, "Other Driver task", 4096, NULL, 3, NULL,
-                          0);
-  // 创建内存监控任务，每5秒打印一次内存占用情况
-  xTaskCreatePinnedToCore(MemoryMonitor_Task, "Memory Monitor", 4096, NULL, 1,
+
+// ============================================================================
+// 初始化函数
+// ============================================================================
+
+/**
+ * @brief 初始化基础驱动
+ */
+static void driver_init(void) {
+  Flash_Searching(); // 启动动画
+  BAT_Init();        // 电池 ADC
+  I2C_Init();        // I2C 总线
+  EXIO_Init();       // IO 扩展器
+  PCF85063_Init();   // RTC 时钟
+
+  // 创建后台任务
+  xTaskCreatePinnedToCore(driver_task, "driver_task", 4096, NULL, 3, NULL, 0);
+  xTaskCreatePinnedToCore(memory_monitor_task, "mem_monitor", 4096, NULL, 1,
                           NULL, 1);
 }
+
+// ============================================================================
+// 主入口
+// ============================================================================
+
 extern "C" void app_main(void) {
-  Driver_Init();
+  // 阶段1：基础驱动初始化
+  driver_init();
 
-  // SD_Init();
+  // 阶段2：显示系统初始化
   LCD_Init();
+
+  // 阶段3：音频系统初始化
   Audio_Init();
-  // MIC_Speech_init();
-  // Play_Music("/sdcard","AAA.mp3");
-  LVGL_Init(); // returns the screen object
 
-  // /********************* Demo *********************/
-  //   Lvgl_Example1();
+  // 阶段4：UI 初始化
+  LVGL_Init();
   ui_init();
-  // lv_demo_widgets();
-  // lv_demo_keypad_encoder();
-  // lv_demo_benchmark();
-  // lv_demo_stress();
-  // lv_demo_music();
 
+  // 阶段5：主循环
   while (1) {
-    // raise the task priority of LVGL and/or reduce the handler period can
-    // improve the performance
     ui_tick();
-    // 增加延迟到5ms，减少刷新频率，降低SPI队列压力
-    // 这样可以避免SPI队列堆积导致的传输失败和花屏问题
-    vTaskDelay(pdMS_TO_TICKS(5));
-    // The task running lv_timer_handler should have lower priority than that
-    // running `lv_tick_inc`
+    vTaskDelay(pdMS_TO_TICKS(5)); // 减少 SPI 队列压力
     lv_timer_handler();
   }
 }

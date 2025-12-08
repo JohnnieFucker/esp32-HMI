@@ -8,100 +8,207 @@
 #include "vars.h"
 #include "styles.h"
 #include "ui.h"
-#include "NoteService.h"
-#include "Wireless.h"
+#include "note_service.h"
+#include "ai_service.h"
+#include "wifi_service.h"
+#include "app_config.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/timers.h"
 #include "lvgl.h"  // 确保包含LVGL主头文件，spinner会自动包含
 #include <string.h>
 
 objects_t objects;
 lv_obj_t *tick_value_change_obj;
 
-// 呼吸灯状态
-static bool breathing_light_running = false;
-static int original_width = 300;   // 按钮原始宽度
-static int original_height = 300;  // 按钮原始高度
-static int original_x = 30;        // 按钮原始X位置
-static int original_y = 30;        // 按钮原始Y位置
+// ============== 通用呼吸灯效果 ==============
+// 呼吸灯状态结构体
+typedef struct {
+    lv_obj_t *btn;           // 按钮对象
+    bool running;            // 是否正在运行
+    int original_width;      // 原始宽度
+    int original_height;     // 原始高度
+    int original_x;          // 原始 X 位置
+    int original_y;          // 原始 Y 位置
+    int original_radius;     // 原始圆角
+} breathing_light_state_t;
 
-// 呼吸灯动画回调：同时改变大小和位置以保持中心点不变
-static void breathing_anim_cb(void * var, int32_t v) {
-    lv_obj_t * obj = (lv_obj_t *)var;
+// page_notes 呼吸灯状态
+static breathing_light_state_t notes_breathing = {0};
+
+// page_conf AI 呼吸灯状态  
+static breathing_light_state_t ai_breathing = {0};
+
+// AI 超时定时器
+static TimerHandle_t ai_timeout_timer = NULL;
+
+// 前向声明
+static void stop_ai_service_cleanup(void);
+
+// 通用呼吸灯动画回调
+static void breathing_anim_exec_cb(void *var, int32_t v) {
+    lv_obj_t *obj = (lv_obj_t *)var;
     
-    // v 是当前的宽度/高度 (从 min_size 到 max_size)
-    int new_width = v;
-    int new_height = v;
+    // 找到对应的状态
+    breathing_light_state_t *state = NULL;
+    if (obj == notes_breathing.btn) {
+        state = &notes_breathing;
+    } else if (obj == ai_breathing.btn) {
+        state = &ai_breathing;
+    }
+    
+    if (state == NULL) return;
+    
+    int new_size = v;
     
     // 计算居中位置
-    // 中心点是 (original_x + original_width/2, original_y + original_height/2)
-    // 假设原始是 30, 30, 300, 300 -> 中心是 180, 180
-    int center_x = original_x + original_width / 2;
-    int center_y = original_y + original_height / 2;
+    int center_x = state->original_x + state->original_width / 2;
+    int center_y = state->original_y + state->original_height / 2;
     
-    int new_x = center_x - new_width / 2;
-    int new_y = center_y - new_height / 2;
+    int new_x = center_x - new_size / 2;
+    int new_y = center_y - new_size / 2;
     
-    lv_obj_set_size(obj, new_width, new_height);
+    lv_obj_set_size(obj, new_size, new_size);
     lv_obj_set_pos(obj, new_x, new_y);
+    lv_obj_set_style_radius(obj, new_size / 2, LV_PART_MAIN | LV_STATE_DEFAULT);
 }
 
-// 启动呼吸灯效果
-static void start_breathing_light(void) {
-    if (breathing_light_running) {
-        return;  // 已经在运行
+/**
+ * 启动按钮呼吸灯效果
+ * @param state 呼吸灯状态结构体
+ * @param btn 目标按钮
+ */
+static void breathing_light_start(breathing_light_state_t *state, lv_obj_t *btn) {
+    if (state->running || btn == NULL) {
+        return;
     }
     
-    if (objects.btn_notes_end != NULL) {
-        // 保存原始信息
-        original_width = lv_obj_get_width(objects.btn_notes_end);
-        original_height = lv_obj_get_height(objects.btn_notes_end);
-        original_x = lv_obj_get_x(objects.btn_notes_end);
-        original_y = lv_obj_get_y(objects.btn_notes_end);
-        
-        // 初始化动画
-        lv_anim_t a;
-        lv_anim_init(&a);
-        lv_anim_set_var(&a, objects.btn_notes_end);
-        
-        // 设置动画参数：从原始大小的 85% 到 100%
-        int32_t min_size = (int32_t)(original_width * 0.85f);
-        int32_t max_size = original_width;
-        
-        lv_anim_set_values(&a, max_size, min_size); // 从大到小
-        lv_anim_set_time(&a, 1000);                 // 半个周期 1秒
-        lv_anim_set_playback_time(&a, 1000);        // 返回时间 1秒
-        lv_anim_set_playback_delay(&a, 0);
-        lv_anim_set_repeat_count(&a, LV_ANIM_REPEAT_INFINITE);
-        lv_anim_set_path_cb(&a, lv_anim_path_ease_in_out); // 平滑的缓动效果
-        
-        // 设置回调函数
-        lv_anim_set_exec_cb(&a, breathing_anim_cb);
-        
-        lv_anim_start(&a);
-        
-        breathing_light_running = true;
+    // 保存原始信息
+    state->btn = btn;
+    state->original_width = lv_obj_get_width(btn);
+    state->original_height = lv_obj_get_height(btn);
+    state->original_x = lv_obj_get_x(btn);
+    state->original_y = lv_obj_get_y(btn);
+    state->original_radius = lv_obj_get_style_radius(btn, LV_PART_MAIN);
+    
+    // 初始化动画
+    lv_anim_t a;
+    lv_anim_init(&a);
+    lv_anim_set_var(&a, btn);
+    
+    // 设置动画参数：从原始大小的 85% 到 100%
+    int32_t min_size = (int32_t)(state->original_width * 0.85f);
+    int32_t max_size = state->original_width;
+    
+    lv_anim_set_values(&a, max_size, min_size);
+    lv_anim_set_time(&a, 1000);
+    lv_anim_set_playback_time(&a, 1000);
+    lv_anim_set_playback_delay(&a, 0);
+    lv_anim_set_repeat_count(&a, LV_ANIM_REPEAT_INFINITE);
+    lv_anim_set_path_cb(&a, lv_anim_path_ease_in_out);
+    lv_anim_set_exec_cb(&a, breathing_anim_exec_cb);
+    
+    lv_anim_start(&a);
+    state->running = true;
+    
+    ESP_LOGI("SCREENS", "呼吸灯启动: btn=%p, size=%d", btn, state->original_width);
+}
+
+/**
+ * 停止按钮呼吸灯效果
+ * @param state 呼吸灯状态结构体
+ */
+static void breathing_light_stop(breathing_light_state_t *state) {
+    if (!state->running || state->btn == NULL) {
+        return;
+    }
+    
+    // 删除动画
+    lv_anim_del(state->btn, breathing_anim_exec_cb);
+    
+    // 恢复原始状态
+    lv_obj_set_size(state->btn, state->original_width, state->original_height);
+    lv_obj_set_pos(state->btn, state->original_x, state->original_y);
+    lv_obj_set_style_radius(state->btn, state->original_radius, LV_PART_MAIN | LV_STATE_DEFAULT);
+    
+    ESP_LOGI("SCREENS", "呼吸灯停止: btn=%p", state->btn);
+    
+    state->running = false;
+    state->btn = NULL;
+}
+
+// ============== page_notes 录音控制 ==============
+
+// 启动录音（显示结束按钮、隐藏开始按钮、启动呼吸灯）
+static void notes_start_recording(void) {
+    start_note_recording();
+    
+    // 隐藏开始按钮，显示结束按钮
+    if (objects.btn_notes_start) {
+        lv_obj_add_flag(objects.btn_notes_start, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (objects.btn_notes_end) {
+        lv_obj_clear_flag(objects.btn_notes_end, LV_OBJ_FLAG_HIDDEN);
+        breathing_light_start(&notes_breathing, objects.btn_notes_end);
     }
 }
 
-// 停止呼吸灯效果
-static void stop_breathing_light(void) {
-    if (!breathing_light_running) {
-        return;  // 未在运行
-    }
+// 停止录音（停止呼吸灯、隐藏结束按钮、显示开始按钮）
+static void notes_stop_recording(void) {
+    stop_note_recording();
     
-    if (objects.btn_notes_end != NULL) {
-        // 删除该对象上的所有动画
-        lv_anim_del(objects.btn_notes_end, breathing_anim_cb);
-        
-        // 恢复原始状态
-        lv_obj_set_size(objects.btn_notes_end, original_width, original_height);
-        lv_obj_set_pos(objects.btn_notes_end, original_x, original_y);
-        // 确保透明度也是不透明的（虽然我们没改透明度，但保险起见）
-        lv_obj_set_style_opa(objects.btn_notes_end, LV_OPA_COVER, LV_PART_MAIN | LV_STATE_DEFAULT);
-    }
+    // 停止呼吸灯
+    breathing_light_stop(&notes_breathing);
     
-    breathing_light_running = false;
+    // 隐藏结束按钮，显示开始按钮
+    if (objects.btn_notes_end) {
+        lv_obj_add_flag(objects.btn_notes_end, LV_OBJ_FLAG_HIDDEN);
+    }
+    if (objects.btn_notes_start) {
+        lv_obj_clear_flag(objects.btn_notes_start, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
+// ============== page_conf AI 服务控制 ==============
+
+// AI 状态变化回调（从 CgAiService 调用）
+static void ai_state_callback(cg_ai_state_t new_state, void *user_data) {
+    ESP_LOGI("SCREENS", "AI 状态变化: %d", new_state);
+    // 可以在这里更新 UI 显示 AI 状态
+}
+
+// 停止 AI 服务并清理资源（不切换界面）
+static void stop_ai_service_cleanup(void) {
+    ESP_LOGI("SCREENS", "停止 AI 服务");
+    
+    // 停止 AI 服务
+    cg_ai_service_stop();
+    
+    // 停止呼吸灯
+    breathing_light_stop(&ai_breathing);
+    
+    // 停止超时定时器
+    if (ai_timeout_timer != NULL) {
+        xTimerStop(ai_timeout_timer, 0);
+        xTimerDelete(ai_timeout_timer, 0);
+        ai_timeout_timer = NULL;
+    }
+}
+
+// 停止 AI 服务并返回主界面
+static void stop_ai_and_return_main(void) {
+    stop_ai_service_cleanup();
+    // 切换到主界面
+    lv_scr_load(objects.main);
+}
+
+// AI 超时定时器回调
+static void ai_timeout_timer_callback(TimerHandle_t xTimer) {
+    // 检查是否超时
+    if (cg_ai_service_is_timeout(CLOSE_CONNECTION_NO_VOICE_TIME)) {
+        ESP_LOGW("SCREENS", "AI 服务超时，自动退出");
+        stop_ai_and_return_main();
+    }
 }
 
 static void event_handler_cb_main_btn_notes(lv_event_t *e) {
@@ -132,6 +239,11 @@ static void event_handler_cb_page_notes_page_notes(lv_event_t *e) {
     (void)flowState;
     
     if (event == LV_EVENT_GESTURE) {
+        // 滑动时停止录音（效果等同于点击结束按钮）
+        if (notes_breathing.running) {
+            ESP_LOGI("SCREENS", "滑动离开 page_notes，停止录音");
+            notes_stop_recording();
+        }
         e->user_data = (void *)0;
         flowPropagateValueLVGLEvent(flowState, 1, 0, e);
     }
@@ -145,9 +257,7 @@ static void event_handler_cb_page_notes_btn_notes_start(lv_event_t *e) {
     if (event == LV_EVENT_CLICKED) {
         e->user_data = (void *)0;
         flowPropagateValueLVGLEvent(flowState, 0, 0, e);
-        start_note_recording();
-        // 启动呼吸灯效果
-        start_breathing_light();
+        notes_start_recording();
     }
 }
 
@@ -159,9 +269,7 @@ static void event_handler_cb_page_notes_btn_notes_end(lv_event_t *e) {
     if (event == LV_EVENT_CLICKED) {
         e->user_data = (void *)0;
         flowPropagateValueLVGLEvent(flowState, 3, 0, e);
-        stop_note_recording();
-        // 停止呼吸灯效果
-        stop_breathing_light();
+        notes_stop_recording();
     }
 }
 
@@ -171,6 +279,11 @@ static void event_handler_cb_page_conf_page_conf(lv_event_t *e) {
     (void)flowState;
     
     if (event == LV_EVENT_GESTURE) {
+        // 滑动时停止 AI 服务（先结束再切换）
+        if (cg_ai_service_is_active()) {
+            ESP_LOGI("SCREENS", "滑动离开 page_conf，停止 AI 服务");
+            stop_ai_service_cleanup();
+        }
         e->user_data = (void *)0;
         flowPropagateValueLVGLEvent(flowState, 1, 0, e);
     }
@@ -178,12 +291,50 @@ static void event_handler_cb_page_conf_page_conf(lv_event_t *e) {
 
 static void event_handler_cb_page_conf_btn_notes_start_1(lv_event_t *e) {
     lv_event_code_t event = lv_event_get_code(e);
-    void *flowState = lv_event_get_user_data(e);
-    (void)flowState;
+    (void)e;
     
     if (event == LV_EVENT_CLICKED) {
-        e->user_data = (void *)0;
-        flowPropagateValueLVGLEvent(flowState, 0, 0, e);
+        // 检查 AI 服务是否正在运行
+        if (!cg_ai_service_is_active()) {
+            // === 启动 AI 服务 ===
+            ESP_LOGI("SCREENS", "AI 按钮点击 - 启动服务");
+            
+            // 初始化 AI 服务
+            esp_err_t ret = cg_ai_service_init();
+            if (ret != ESP_OK) {
+                ESP_LOGE("SCREENS", "AI 服务初始化失败");
+                return;
+            }
+            
+            // 设置状态回调
+            cg_ai_service_set_state_callback(ai_state_callback, NULL);
+            
+            // 启动 AI 服务
+            ret = cg_ai_service_start();
+            if (ret != ESP_OK) {
+                ESP_LOGE("SCREENS", "AI 服务启动失败");
+                cg_ai_service_deinit();
+                return;
+            }
+            
+            // 启动呼吸灯效果
+            breathing_light_start(&ai_breathing, objects.btn_notes_start_1);
+            
+            // 启动超时检测定时器
+            if (ai_timeout_timer == NULL) {
+                ai_timeout_timer = xTimerCreate("ai_timeout", pdMS_TO_TICKS(1000), pdTRUE, 
+                                                NULL, ai_timeout_timer_callback);
+            }
+            if (ai_timeout_timer != NULL) {
+                xTimerStart(ai_timeout_timer, 0);
+            }
+            
+            ESP_LOGI("SCREENS", "AI 服务已启动");
+        } else {
+            // === 停止 AI 服务 ===
+            ESP_LOGI("SCREENS", "AI 按钮点击 - 停止服务");
+            stop_ai_and_return_main();
+        }
     }
 }
 
@@ -447,6 +598,7 @@ void create_screen_page_conf() {
             objects.btn_notes_start_1 = obj;
             lv_obj_set_pos(obj, 130, 130);
             lv_obj_set_size(obj, 100, 100);
+            lv_obj_add_event_cb(obj, event_handler_cb_page_conf_btn_notes_start_1, LV_EVENT_ALL, flowState);  // 添加事件处理器
             lv_obj_set_style_radius(obj, 50, LV_PART_MAIN | LV_STATE_DEFAULT);
             lv_obj_set_style_text_font(obj, &ui_font_chinese_18, LV_PART_MAIN | LV_STATE_DEFAULT);
             lv_obj_set_style_bg_color(obj, lv_color_hex(0xff2196f3), LV_PART_MAIN | LV_STATE_DEFAULT);
@@ -469,6 +621,11 @@ void create_screen_page_conf() {
 }
 
 void delete_screen_page_conf() {
+    // 清理 AI 相关资源
+    if (cg_ai_service_is_active()) {
+        stop_ai_service_cleanup();
+    }
+    
     lv_obj_del(objects.page_conf);
     objects.page_conf = 0;
     objects.btn_notes_start_1 = 0;

@@ -360,13 +360,22 @@ int start_note_recording(void) {
     return 0;
 }
 
-int stop_note_recording(void) {
+// 最小有效录音时长（秒）
+#define MIN_RECORDING_DURATION_SEC 60
+
+int stop_note_recording(uint32_t duration_sec) {
     if (!g_record_task_running && !g_upload_task_running) {
         ESP_LOGW(TAG, "录音未在进行");
         return 0;
     }
 
-    ESP_LOGI(TAG, "停止录音...");
+    ESP_LOGI(TAG, "停止录音... (持续时间: %lu 秒)", (unsigned long)duration_sec);
+    
+    // 判断是否需要提交数据
+    bool should_submit = (duration_sec >= MIN_RECORDING_DURATION_SEC);
+    if (!should_submit) {
+        ESP_LOGI(TAG, "录音时长不足 %d 秒，不提交数据", MIN_RECORDING_DURATION_SEC);
+    }
     
     // 1. 先停止录音任务
     g_record_task_running = false;
@@ -388,22 +397,38 @@ int stop_note_recording(void) {
     }
     ESP_LOGI(TAG, "录音任务已停止");
     
-    // 2. 等待上传任务处理完队列中的所有数据
-    int queue_count = uxQueueMessagesWaiting(g_upload_queue);
-    if (queue_count > 0) {
-        ESP_LOGI(TAG, "等待上传队列中的 %d 个文件上传完成...", queue_count);
-    }
+    // 保存UUID副本（在清空前）
+    char uuid_copy[64];
+    strncpy(uuid_copy, g_current_uuid, sizeof(uuid_copy) - 1);
+    uuid_copy[sizeof(uuid_copy) - 1] = '\0';
     
-    wait = 0;
-    while (uxQueueMessagesWaiting(g_upload_queue) > 0 && wait < 600) {  // 最多等待60秒
-        vTaskDelay(pdMS_TO_TICKS(100));
-        wait++;
-        if (wait % 50 == 0) {
-            ESP_LOGI(TAG, "等待上传完成，队列剩余: %d", uxQueueMessagesWaiting(g_upload_queue));
+    if (should_submit) {
+        // 2. 等待上传任务处理完队列中的所有数据
+        int queue_count = uxQueueMessagesWaiting(g_upload_queue);
+        if (queue_count > 0) {
+            ESP_LOGI(TAG, "等待上传队列中的 %d 个文件上传完成...", queue_count);
+        }
+        
+        wait = 0;
+        while (uxQueueMessagesWaiting(g_upload_queue) > 0 && wait < 600) {  // 最多等待60秒
+            vTaskDelay(pdMS_TO_TICKS(100));
+            wait++;
+            if (wait % 50 == 0) {
+                ESP_LOGI(TAG, "等待上传完成，队列剩余: %d", uxQueueMessagesWaiting(g_upload_queue));
+            }
+        }
+    } else {
+        // 不提交数据时，清空上传队列中的数据
+        upload_item_t item;
+        while (xQueueReceive(g_upload_queue, &item, 0) == pdTRUE) {
+            if (item.wav_buffer != NULL) {
+                free(item.wav_buffer);
+            }
+            ESP_LOGI(TAG, "丢弃未上传的录音文件: %s", item.filename);
         }
     }
     
-    // 3. 队列清空后，停止上传任务
+    // 3. 停止上传任务
     g_upload_task_running = false;
     
     wait = 0;
@@ -412,13 +437,8 @@ int stop_note_recording(void) {
         wait++;
     }
     ESP_LOGI(TAG, "上传任务已停止");
-
-    // 4. 保存UUID副本（在清空前）
-    char uuid_copy[64];
-    strncpy(uuid_copy, g_current_uuid, sizeof(uuid_copy) - 1);
-    uuid_copy[sizeof(uuid_copy) - 1] = '\0';
     
-    // 5. 清理
+    // 4. 清理
     audio_recorder_deinit();
     
     if (g_upload_queue != NULL) {
@@ -429,17 +449,21 @@ int stop_note_recording(void) {
     memset(g_current_uuid, 0, sizeof(g_current_uuid));
     g_file_counter = 0;
 
-    ESP_LOGI(TAG, "录音已完全停止，所有文件已上传");
-    
-    // 6. 使用保存的UUID副本调用生成笔记接口
-    if (strlen(uuid_copy) > 0) {
-        int ret = generate_note(uuid_copy, "box", true, 2, "box1.0");
-        if (ret != 0) {
-            ESP_LOGE(TAG, "生成笔记失败");
-            return -1;
+    if (should_submit) {
+        ESP_LOGI(TAG, "录音已完全停止，所有文件已上传");
+        
+        // 5. 使用保存的UUID副本调用生成笔记接口
+        if (strlen(uuid_copy) > 0) {
+            int ret = generate_note(uuid_copy, "box", true, 2, "box1.0");
+            if (ret != 0) {
+                ESP_LOGE(TAG, "生成笔记失败");
+                return -1;
+            }
+        } else {
+            ESP_LOGW(TAG, "UUID为空，跳过生成笔记");
         }
     } else {
-        ESP_LOGW(TAG, "UUID为空，跳过生成笔记");
+        ESP_LOGI(TAG, "录音已停止（时长不足，未提交数据）");
     }
     
     return 0;

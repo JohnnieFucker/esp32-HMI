@@ -27,14 +27,23 @@ extern "C" {
 
 /**
  * @brief AI 服务状态枚举
+ *
+ * 状态流转：
+ * IDLE → CONNECTING → CONNECTED → LISTENING → SENDING → SPEAKING → LISTENING
+ *                                     ↑_______________________________↓
+ *
+ * VAD 控制：
+ * - LISTENING: VAD 开启，检测语音
+ * - SENDING:   VAD 关闭，发送音频数据
+ * - SPEAKING:  VAD 关闭，播放 AI 回复
  */
 typedef enum {
   CG_AI_STATE_IDLE = 0,   // 空闲状态
-  CG_AI_STATE_CONNECTING, // 正在连接
-  CG_AI_STATE_CONNECTED,  // 已连接
-  CG_AI_STATE_LISTENING,  // 正在监听（录音中）
-  CG_AI_STATE_PROCESSING, // 正在处理（等待AI响应）
-  CG_AI_STATE_SPEAKING,   // 正在播放AI回复
+  CG_AI_STATE_CONNECTING, // 正在连接 WebSocket
+  CG_AI_STATE_CONNECTED,  // 已连接，等待初始化
+  CG_AI_STATE_LISTENING,  // 聆听中（VAD 开启）
+  CG_AI_STATE_SENDING,    // 发送中（VAD 关闭，正在发送音频）
+  CG_AI_STATE_SPEAKING,   // 播放中（VAD 关闭，播放 AI 回复）
   CG_AI_STATE_ERROR       // 错误状态
 } cg_ai_state_t;
 

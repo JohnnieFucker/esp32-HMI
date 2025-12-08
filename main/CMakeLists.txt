@@ -84,6 +84,7 @@ idf_component_register(
         
         # UI 层
         ${UI_DIR}
+        ${UI_DIR}/pages
         
         # 工具和根目录
         "./utils"

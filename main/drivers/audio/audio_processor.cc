@@ -29,8 +29,8 @@ void AudioProcessor::Initialize(int channels, bool reference) {
   afe_config->aec_mode = AEC_MODE_VOIP_HIGH_PERF;
   afe_config->ns_init = true;
   afe_config->vad_init = true;
-  afe_config->vad_mode = VAD_MODE_0;
-  afe_config->vad_min_noise_ms = 100;
+  afe_config->vad_mode = VAD_MODE_0;  // VAD 模式（与 koi_esp32 一致）
+  afe_config->vad_min_noise_ms = 500; // 最小静音时间 500ms 才算断句
   afe_config->afe_perferred_core = 1;
   afe_config->afe_perferred_priority = 1;
   afe_config->agc_init = true;

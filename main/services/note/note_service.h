@@ -5,6 +5,7 @@ extern "C" {
 #endif
 
 #include <stdbool.h>
+#include <stdint.h>
 
 /**
  * 开始录音业务逻辑
@@ -17,9 +18,12 @@ int start_note_recording(void);
 /**
  * 停止录音业务逻辑
  *
+ * @param duration_sec 录音持续时间（秒），用于判断是否提交数据
+ *                     如果 >= 60 秒则上传数据并生成笔记
+ *                     如果 < 60 秒则只停止录音，不提交数据
  * @return 0 成功，非0 失败
  */
-int stop_note_recording(void);
+int stop_note_recording(uint32_t duration_sec);
 
 /**
  * 生成笔记

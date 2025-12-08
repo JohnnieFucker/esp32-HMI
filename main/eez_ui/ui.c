@@ -205,14 +205,14 @@ static int screen_switch_verify_count = 0;  // 屏幕切换验证计数（最多
 // 重要说明：
 //   1. 计算objects结构体中对象的数量（所有lv_obj_t*成员的数量）
 //   2. objects_t结构体包含: loading, main, page_notes, page_conf, btn_notes, obj0, 
-//      btn_notes_start, btn_notes_end, btn_notes_start_1, obj1, lab_loading, obj2
+//      btn_notes_start, btn_notes_end, btn_ai_start, obj1, lab_loading, obj2
 //      共12个对象
 //   3. eez_flow_init会调用create_screens()创建所有屏幕，并默认加载loading屏幕（ID=1）
 //   4. wifi_check_started设置为true，开始WiFi连接检查
 void ui_init() {
     // 计算objects结构体中对象的数量（所有lv_obj_t*成员的数量）
     // objects_t结构体包含: loading, main, page_notes, page_conf, btn_notes, obj0, 
-    // btn_notes_start, btn_notes_end, btn_notes_start_1, obj1, lab_loading, obj2
+    // btn_notes_start, btn_notes_end, btn_ai_start, obj1, lab_loading, obj2
     // 共12个对象
     const size_t num_objects = sizeof(objects) / sizeof(lv_obj_t *);
     ESP_LOGI("UI", "[ui_init] 初始化UI系统");

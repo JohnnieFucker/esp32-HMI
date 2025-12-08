@@ -154,7 +154,31 @@ cg_ai_service_start()
 
 **状态机：**
 ```
-IDLE → CONNECTING → CONNECTED → LISTENING ⇄ SPEAKING → IDLE
+IDLE → CONNECTING → CONNECTED → LISTENING → SENDING → SPEAKING
+                                    ↑________________________↓
+                                (只有 TTS 播放完成后才回到 LISTENING)
+
+状态说明：
+- IDLE:       空闲，服务未运行
+- CONNECTING: 正在连接 WebSocket（按钮显示"连接中"）
+- CONNECTED:  已连接，初始化中
+- LISTENING:  聆听中（VAD 开启，按钮显示"聆听中"）
+- SENDING:    发送中（VAD 关闭，按钮显示"发送中"，呼吸灯开启）
+- SPEAKING:   播放中（VAD 关闭，按钮显示"播放中"，呼吸灯开启）
+
+VAD 控制：
+- 仅在 LISTENING 状态启动 VAD
+- 进入 SENDING/SPEAKING 状态时自动停止 VAD
+- 只有 TTS 播放完成（收到 tts:stop）后才回到 LISTENING 状态并重启 VAD
+
+呼吸灯控制：
+- 仅在 SENDING 和 SPEAKING 状态启动呼吸灯效果
+- 其他状态（LISTENING 等）无呼吸灯
+
+按钮文本变化：
+- 进入 AI 模式：显示"开始"
+- 点击开始后：按状态显示"连接中"/"聆听中"/"发送中"/"播放中"
+- 退出 AI 模式：恢复之前的文本
 ```
 
 ### 3. 笔记录音服务 (services/note/)

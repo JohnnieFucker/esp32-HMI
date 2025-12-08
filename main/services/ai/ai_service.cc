@@ -12,11 +12,11 @@
 #include "app_config.h"
 
 extern "C" {
-#include "mic_driver.h"
-#include "pcm5101.h"
 #include "driver/i2s_std.h"
 #include "esp_system.h"
 #include "esp_wifi.h"
+#include "mic_driver.h"
+#include "pcm5101.h"
 #include <sys/time.h>
 #include <time.h>
 }
@@ -24,6 +24,8 @@ extern "C" {
 #include "audio_processor.h"
 #include "opus_decoder.h"
 #include "opus_encoder.h"
+
+#include <cmath>
 
 #include "cJSON.h"
 #include "esp_log.h"
@@ -152,7 +154,7 @@ private:
   (OPUS_SAMPLE_RATE * OPUS_FRAME_DURATION_MS / 1000) // 每帧采样数 = 320
 
 #define MIC_READ_SAMPLES OPUS_FRAME_SIZE
-#define AUDIO_QUEUE_SIZE 50 // 音频队列大小（帧更小了，队列可以更大）
+#define AUDIO_QUEUE_SIZE 200 // 音频队列大小（约 12 秒，避免丢弃 TTS 音频）
 
 // I2S 输出采样率
 #define I2S_OUT_SAMPLE_RATE 16000
@@ -189,7 +191,30 @@ static bool g_is_speaking = false;           // VAD 检测到的说话状态
 
 // VAD 预缓冲（保留语音开始前的音频，避免丢失开头）
 static std::deque<std::vector<int16_t>> g_pre_speech_buffer; // 预缓冲队列
-static const size_t PRE_SPEECH_BUFFER_COUNT = 5; // 保留最近 10 帧（约 200ms）
+static const size_t PRE_SPEECH_BUFFER_COUNT = 5;             // 保留最近 5 帧
+
+// VAD 防抖参数
+static uint32_t g_listening_start_time = 0; // 进入 LISTENING 状态的时间
+static uint32_t g_speech_start_time = 0;    // 开始说话的时间
+static const uint32_t VAD_STARTUP_IGNORE_MS =
+    300; // 录音开始后忽略 VAD 的时间（ms）
+static const uint32_t MIN_SPEECH_DURATION_MS = 300; // 最小有效说话时长
+static const int32_t MIN_AUDIO_ENERGY_THRESHOLD =
+    500; // 最小音频能量阈值（RMS）
+
+/**
+ * 计算音频的 RMS 能量（用于过滤噪音）
+ */
+static int32_t calculate_audio_rms(const std::vector<int16_t> &audio) {
+  if (audio.empty())
+    return 0;
+
+  int64_t sum_squares = 0;
+  for (const auto &sample : audio) {
+    sum_squares += (int64_t)sample * sample;
+  }
+  return (int32_t)sqrt((double)sum_squares / audio.size());
+}
 
 // WebSocket 二进制消息分片缓冲区
 static std::vector<uint8_t> g_ws_binary_buffer;
@@ -201,6 +226,9 @@ static bool g_i2s_output_configured = false;
 static uint32_t g_last_activity_time = 0;
 static bool g_server_hello_received = false;
 static int g_server_sample_rate = 16000;
+
+// 会话 ID（从服务器 hello 响应中获取，所有消息都需要包含）
+static std::string g_session_id;
 
 // WebSocket headers（需要在整个连接期间保持有效）
 static std::string g_ws_headers;
@@ -215,6 +243,7 @@ static void update_activity_time(void) { g_last_activity_time = get_time_ms(); }
 
 // 前向声明
 static void send_accumulated_audio(void);
+static void set_state(cg_ai_state_t new_state);
 
 /**
  * 延迟初始化 AudioProcessor（esp-sr）
@@ -239,6 +268,18 @@ static void init_audio_processor(void) {
 
   // 设置 VAD 状态变化回调
   g_audio_processor->OnVadStateChange([](bool speaking) {
+    uint32_t now = get_time_ms();
+
+    // 防抖：忽略录音开始后的前 N 毫秒的 VAD 事件
+    if (g_listening_start_time > 0) {
+      uint32_t elapsed = now - g_listening_start_time;
+      if (elapsed < VAD_STARTUP_IGNORE_MS) {
+        ESP_LOGD(TAG, "忽略 VAD 事件（录音启动防抖期，已过 %lu ms）",
+                 (unsigned long)elapsed);
+        return;
+      }
+    }
+
     ESP_LOGI(TAG, "VAD 状态变化: %s", speaking ? "说话中" : "静音");
 
     bool should_send = false;
@@ -248,7 +289,8 @@ static void init_audio_processor(void) {
       std::lock_guard<std::mutex> lock(g_speech_buffer_mutex);
 
       if (speaking) {
-        // 开始说话：先把预缓冲区的数据加入语音缓冲区（保留开头）
+        // 开始说话：记录开始时间，把预缓冲区的数据加入语音缓冲区
+        g_speech_start_time = now;
         g_is_speaking = true;
         g_speech_buffer.clear();
 
@@ -261,18 +303,35 @@ static void init_audio_processor(void) {
         }
         g_pre_speech_buffer.clear();
 
-        ESP_LOGI(TAG, "开始检测到语音，已添加 %d 采样的预缓冲", pre_samples);
+        ESP_LOGI(TAG, "开始检测到语音，已添加 %zu 采样的预缓冲", pre_samples);
       } else {
-        // 停止说话（断句）：检查是否需要发送
+        // 停止说话（断句）：检查说话时长和音频能量
         if (g_is_speaking && !g_speech_buffer.empty()) {
-          ESP_LOGI(TAG, "检测到断句，准备发送累积的音频");
-          should_send = true;
+          uint32_t speech_duration = now - g_speech_start_time;
+          int32_t audio_rms = calculate_audio_rms(g_speech_buffer);
+
+          if (speech_duration < MIN_SPEECH_DURATION_MS) {
+            ESP_LOGI(TAG, "说话时长不足 (%lu ms < %lu ms)，忽略",
+                     (unsigned long)speech_duration,
+                     (unsigned long)MIN_SPEECH_DURATION_MS);
+            g_speech_buffer.clear();
+          } else if (audio_rms < MIN_AUDIO_ENERGY_THRESHOLD) {
+            ESP_LOGI(TAG, "音频能量不足 (RMS=%ld < %ld)，判定为噪音，忽略",
+                     (long)audio_rms, (long)MIN_AUDIO_ENERGY_THRESHOLD);
+            g_speech_buffer.clear();
+          } else {
+            ESP_LOGI(TAG, "检测到断句，时长: %lu ms，能量 RMS=%ld，准备发送",
+                     (unsigned long)speech_duration, (long)audio_rms);
+            should_send = true;
+          }
         }
         g_is_speaking = false;
+        g_speech_start_time = 0;
       }
     }
 
     // 在锁外发送，避免死锁
+    // 注意：不要在这里改变状态，直接发送即可
     if (should_send) {
       send_accumulated_audio();
     }
@@ -298,6 +357,37 @@ static void init_audio_processor(void) {
   ESP_LOGI(TAG, "AudioProcessor 延迟初始化完成");
 }
 
+/**
+ * 状态名称（用于日志）
+ */
+static const char *get_state_name(cg_ai_state_t state) {
+  switch (state) {
+  case CG_AI_STATE_IDLE:
+    return "IDLE";
+  case CG_AI_STATE_CONNECTING:
+    return "CONNECTING";
+  case CG_AI_STATE_CONNECTED:
+    return "CONNECTED";
+  case CG_AI_STATE_LISTENING:
+    return "LISTENING";
+  case CG_AI_STATE_SENDING:
+    return "SENDING";
+  case CG_AI_STATE_SPEAKING:
+    return "SPEAKING";
+  case CG_AI_STATE_ERROR:
+    return "ERROR";
+  default:
+    return "UNKNOWN";
+  }
+}
+
+/**
+ * 统一状态管理
+ *
+ * VAD 控制规则：
+ * - LISTENING: VAD 开启
+ * - SENDING/SPEAKING/其他: VAD 关闭
+ */
 static void set_state(cg_ai_state_t new_state) {
   if (g_state_mutex) {
     xSemaphoreTake(g_state_mutex, portMAX_DELAY);
@@ -306,14 +396,56 @@ static void set_state(cg_ai_state_t new_state) {
   cg_ai_state_t old_state = g_state;
 
   if (old_state != new_state) {
-    ESP_LOGI(TAG, "状态变化: %d -> %d", old_state, new_state);
+    ESP_LOGI(TAG, "状态变化: %s -> %s", get_state_name(old_state),
+             get_state_name(new_state));
     g_state = new_state;
 
-    // 进入 SPEAKING 状态：暂停音频处理器
+    // ========== VAD 控制逻辑 ==========
+    // 进入 LISTENING 状态：启动 VAD
+    if (new_state == CG_AI_STATE_LISTENING) {
+      // 记录进入 LISTENING 的时间（用于 VAD 防抖）
+      g_listening_start_time = get_time_ms();
+      g_speech_start_time = 0;
+
+      // 清空缓冲区
+      {
+        std::lock_guard<std::mutex> lock(g_speech_buffer_mutex);
+        g_speech_buffer.clear();
+        g_pre_speech_buffer.clear();
+        g_is_speaking = false;
+      }
+      // 启动音频处理器（VAD）
+      if (g_audio_processor && !g_audio_processor->IsRunning()) {
+        g_audio_processor->Start();
+        ESP_LOGI(TAG, "VAD 已启动（%lu ms 后开始检测）",
+                 (unsigned long)VAD_STARTUP_IGNORE_MS);
+      }
+      // 重置超时计时
+      update_activity_time();
+    }
+
+    // 离开 LISTENING 状态：停止 VAD
+    if (old_state == CG_AI_STATE_LISTENING &&
+        new_state != CG_AI_STATE_LISTENING) {
+      if (g_audio_processor && g_audio_processor->IsRunning()) {
+        g_audio_processor->Stop();
+        ESP_LOGI(TAG, "VAD 已停止");
+      }
+    }
+
+    // 进入 SENDING 状态：确保 VAD 关闭
+    if (new_state == CG_AI_STATE_SENDING) {
+      if (g_audio_processor && g_audio_processor->IsRunning()) {
+        g_audio_processor->Stop();
+        ESP_LOGI(TAG, "进入发送状态，VAD 已停止");
+      }
+    }
+
+    // 进入 SPEAKING 状态：确保 VAD 关闭，清空缓冲区
     if (new_state == CG_AI_STATE_SPEAKING) {
       if (g_audio_processor && g_audio_processor->IsRunning()) {
         g_audio_processor->Stop();
-        ESP_LOGI(TAG, "暂停音频处理器（播放 TTS）");
+        ESP_LOGI(TAG, "进入播放状态，VAD 已停止");
       }
       // 清空语音缓冲区
       {
@@ -324,25 +456,7 @@ static void set_state(cg_ai_state_t new_state) {
       }
     }
 
-    // 从 SPEAKING 回到 LISTENING：恢复音频处理器
-    if (old_state == CG_AI_STATE_SPEAKING &&
-        new_state == CG_AI_STATE_LISTENING) {
-      // 清空预缓冲和语音缓冲
-      {
-        std::lock_guard<std::mutex> lock(g_speech_buffer_mutex);
-        g_speech_buffer.clear();
-        g_pre_speech_buffer.clear();
-        g_is_speaking = false;
-      }
-      // 重新启动音频处理器
-      if (g_audio_processor && !g_audio_processor->IsRunning()) {
-        g_audio_processor->Start();
-        ESP_LOGI(TAG, "恢复音频处理器（TTS 播放完成）");
-      }
-      // 更新活动时间，重置超时计时
-      update_activity_time();
-    }
-
+    // 回调通知
     if (g_state_callback) {
       g_state_callback(new_state, g_callback_user_data);
     }
@@ -456,8 +570,15 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base,
     break;
 
   case WEBSOCKET_EVENT_DISCONNECTED:
-    ESP_LOGW(TAG, "WebSocket 断开连接");
+    ESP_LOGW(TAG, "WebSocket 断开连接，重置状态");
     g_server_hello_received = false;
+    g_session_id.clear();
+    g_running = false; // 允许重新启动
+    // 清空音频队列
+    {
+      std::lock_guard<std::mutex> lock(g_audio_mutex);
+      g_audio_out_queue.clear();
+    }
     set_state(CG_AI_STATE_IDLE);
     break;
 
@@ -487,15 +608,15 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base,
       if (message_complete && !g_ws_binary_buffer.empty()) {
         ESP_LOGD(TAG, "收到完整 Opus 数据: %zu 字节",
                  g_ws_binary_buffer.size());
-        // 将原始 Opus 数据加入播放队列（在播放任务中解码）
-        {
+        // 在 SENDING 或 SPEAKING 状态下接收音频
+        if (g_state == CG_AI_STATE_SPEAKING || g_state == CG_AI_STATE_SENDING) {
+          // 收到 TTS 音频时自动进入 SPEAKING 状态（不依赖 tts start 消息）
+          if (g_state == CG_AI_STATE_SENDING) {
+            set_state(CG_AI_STATE_SPEAKING);
+            ESP_LOGI(TAG, "收到 TTS 音频，自动进入播放状态");
+          }
           std::lock_guard<std::mutex> lock(g_audio_mutex);
           g_audio_out_queue.push_back(std::move(g_ws_binary_buffer));
-
-          // 限制队列大小
-          while (g_audio_out_queue.size() > AUDIO_QUEUE_SIZE) {
-            g_audio_out_queue.pop_front();
-          }
         }
         g_ws_binary_buffer.clear();
       }
@@ -512,7 +633,14 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base,
           ESP_LOGI(TAG, "收到消息类型: %s", type_str);
 
           if (strcmp(type_str, "hello") == 0) {
-            // 服务器 hello 响应
+            // 服务器 hello 响应 - 只在 CONNECTING 状态时处理
+            if (g_state != CG_AI_STATE_CONNECTING) {
+              ESP_LOGW(TAG,
+                       "收到重复的 hello 消息，忽略（当前状态非 CONNECTING）");
+              cJSON_Delete(root);
+              break;
+            }
+
             cJSON *audio_params = cJSON_GetObjectItem(root, "audio_params");
             if (audio_params) {
               cJSON *sample_rate =
@@ -521,6 +649,13 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base,
                 g_server_sample_rate = sample_rate->valueint;
                 ESP_LOGI(TAG, "服务器采样率: %d", g_server_sample_rate);
               }
+            }
+
+            // 保存 session_id（后续所有消息都需要）
+            cJSON *session_id = cJSON_GetObjectItem(root, "session_id");
+            if (session_id && cJSON_IsString(session_id)) {
+              g_session_id = session_id->valuestring;
+              ESP_LOGI(TAG, "会话 ID: %s", g_session_id.c_str());
             }
 
             g_server_hello_received = true;
@@ -534,11 +669,20 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base,
             cJSON *state = cJSON_GetObjectItem(root, "state");
             if (state && cJSON_IsString(state)) {
               if (strcmp(state->valuestring, "start") == 0) {
+                // AI 开始说话：进入 SPEAKING 状态
                 set_state(CG_AI_STATE_SPEAKING);
+                ESP_LOGI(TAG, "AI 开始播放语音回复");
               } else if (strcmp(state->valuestring, "stop") == 0) {
+                // AI 说完：从 SPEAKING 回到 LISTENING（唯一回到 LISTENING
+                // 的路径）
                 set_state(CG_AI_STATE_LISTENING);
+                ESP_LOGI(TAG, "AI 语音播放完成，恢复监听");
               }
             }
+          } else if (strcmp(type_str, "stt_end") == 0 ||
+                     strcmp(type_str, "asr_end") == 0) {
+            // 语音识别结束，如果当前在 SENDING 状态，保持等待 TTS
+            ESP_LOGI(TAG, "语音识别处理完成");
           } else if (strcmp(type_str, "stt") == 0) {
             cJSON *text = cJSON_GetObjectItem(root, "text");
             if (text && cJSON_IsString(text)) {
@@ -553,8 +697,29 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base,
     break;
 
   case WEBSOCKET_EVENT_ERROR:
-    ESP_LOGE(TAG, "WebSocket 错误");
-    set_state(CG_AI_STATE_ERROR);
+    ESP_LOGE(TAG, "WebSocket 错误，重置状态");
+    g_server_hello_received = false;
+    g_session_id.clear();
+    g_running = false; // 允许重新启动
+    // 清空音频队列
+    {
+      std::lock_guard<std::mutex> lock(g_audio_mutex);
+      g_audio_out_queue.clear();
+    }
+    set_state(CG_AI_STATE_IDLE);
+    break;
+
+  case WEBSOCKET_EVENT_CLOSED:
+    ESP_LOGW(TAG, "WebSocket 已关闭，重置状态");
+    g_server_hello_received = false;
+    g_session_id.clear();
+    g_running = false; // 允许重新启动
+    // 清空音频队列
+    {
+      std::lock_guard<std::mutex> lock(g_audio_mutex);
+      g_audio_out_queue.clear();
+    }
+    set_state(CG_AI_STATE_IDLE);
     break;
 
   default:
@@ -620,49 +785,129 @@ static void websocket_disconnect(void) {
     g_ws_client = nullptr;
   }
   g_server_hello_received = false;
+  g_session_id.clear();
 }
 
 static void websocket_send_audio(const std::vector<uint8_t> &opus_data) {
-  if (g_ws_client && esp_websocket_client_is_connected(g_ws_client)) {
-    esp_websocket_client_send_bin(g_ws_client, (const char *)opus_data.data(),
-                                  opus_data.size(), portMAX_DELAY);
+  if (!g_ws_client) {
+    ESP_LOGE(TAG, "WebSocket 客户端为空，无法发送音频");
+    return;
+  }
+
+  if (!esp_websocket_client_is_connected(g_ws_client)) {
+    ESP_LOGE(TAG, "WebSocket 未连接，无法发送音频");
+    // 连接已断开，重置状态
+    if (g_state != CG_AI_STATE_IDLE) {
+      ESP_LOGW(TAG, "检测到连接断开，重置状态到 IDLE");
+      g_server_hello_received = false;
+      g_session_id.clear();
+      g_running = false; // 允许重新启动
+      {
+        std::lock_guard<std::mutex> lock(g_audio_mutex);
+        g_audio_out_queue.clear();
+      }
+      set_state(CG_AI_STATE_IDLE);
+    }
+    return;
+  }
+
+  static int send_count = 0;
+  send_count++;
+
+  ESP_LOGI(TAG, ">>> 发送 Opus 帧 #%d: %zu 字节", send_count, opus_data.size());
+
+  int ret =
+      esp_websocket_client_send_bin(g_ws_client, (const char *)opus_data.data(),
+                                    opus_data.size(), portMAX_DELAY);
+  if (ret < 0) {
+    ESP_LOGE(TAG, "!!! 发送失败，返回值: %d", ret);
+  } else {
+    ESP_LOGI(TAG, "<<< 发送成功，返回值: %d 字节", ret);
   }
 }
 
 static void websocket_send_start_listening(void) {
   if (g_ws_client && esp_websocket_client_is_connected(g_ws_client)) {
-    const char *msg =
-        "{\"type\":\"listen\",\"state\":\"start\",\"mode\":\"auto\"}";
-    esp_websocket_client_send_text(g_ws_client, msg, strlen(msg),
+    // 包含 session_id（服务器需要识别会话）
+    std::string msg =
+        "{\"session_id\":\"" + g_session_id +
+        "\",\"type\":\"listen\",\"state\":\"start\",\"mode\":\"auto\"}";
+    esp_websocket_client_send_text(g_ws_client, msg.c_str(), msg.length(),
                                    portMAX_DELAY);
-    ESP_LOGI(TAG, "发送开始监听消息");
+    ESP_LOGI(TAG, "发送开始监听消息: %s", msg.c_str());
+  }
+}
+
+static void websocket_send_stop_listening(void) {
+  if (g_ws_client && esp_websocket_client_is_connected(g_ws_client)) {
+    std::string msg = "{\"session_id\":\"" + g_session_id +
+                      "\",\"type\":\"listen\",\"state\":\"stop\"}";
+    esp_websocket_client_send_text(g_ws_client, msg.c_str(), msg.length(),
+                                   portMAX_DELAY);
+    ESP_LOGI(TAG, "发送停止监听消息: %s", msg.c_str());
+
+    // 发送一帧静音音频，触发服务器处理
+    // 服务器在 handleAudioMessage 中检查
+    // client_voice_stop，需要收到音频才能触发
+    if (g_opus_encoder) {
+      std::vector<int16_t> silence(OPUS_FRAME_SIZE, 0);
+      g_opus_encoder->Encode(std::move(silence),
+                             [](std::vector<uint8_t> &&opus) {
+                               websocket_send_audio(opus);
+                               ESP_LOGI(TAG, "发送静音帧触发服务器处理");
+                             });
+    }
   }
 }
 
 /**
  * 发送累积的音频数据（在断句时调用）
+ * 发送完成后等待服务器 TTS 响应，只有 TTS 播放完成后才回到 LISTENING
  */
 static void send_accumulated_audio(void) {
-  std::lock_guard<std::mutex> lock(g_speech_buffer_mutex);
-
-  if (g_speech_buffer.empty()) {
+  // 如果已经断开连接，不再尝试发送
+  if (!g_running || g_state == CG_AI_STATE_IDLE) {
+    ESP_LOGW(TAG, "连接已断开，跳过发送累积音频");
+    // 清空缓冲区
+    std::lock_guard<std::mutex> lock(g_speech_buffer_mutex);
+    g_speech_buffer.clear();
     return;
   }
 
-  ESP_LOGI(TAG, "发送累积的音频数据，大小: %zu 采样", g_speech_buffer.size());
+  std::vector<int16_t> audio_to_send;
+
+  {
+    std::lock_guard<std::mutex> lock(g_speech_buffer_mutex);
+
+    if (g_speech_buffer.empty()) {
+      return;
+    }
+
+    ESP_LOGI(TAG, "发送累积的音频数据，大小: %zu 采样", g_speech_buffer.size());
+
+    // 复制数据，因为会被移动到后台任务
+    audio_to_send = std::move(g_speech_buffer);
+    g_speech_buffer.clear();
+  }
 
   // 将累积的音频数据编码并发送
   if (g_background_task && g_opus_encoder) {
-    // 复制数据，因为会被移动到后台任务
-    std::vector<int16_t> audio_to_send = std::move(g_speech_buffer);
-    g_speech_buffer.clear();
-
+    size_t total_samples = audio_to_send.size();
     g_background_task->Schedule(
-        [audio_to_send = std::move(audio_to_send)]() mutable {
+        [audio_to_send = std::move(audio_to_send), total_samples]() mutable {
+          // 再次检查：任务执行时可能连接已断开
+          if (!g_running || g_state == CG_AI_STATE_IDLE) {
+            ESP_LOGW(TAG, "编码任务执行时连接已断开，跳过");
+            return;
+          }
           if (g_opus_encoder) {
-            // 将音频数据分帧编码（Opus 每帧 320 采样，20ms）
+            // 将音频数据分帧编码（Opus 每帧 960 采样，60ms）
             const size_t frame_size = OPUS_FRAME_SIZE;
             size_t offset = 0;
+            int frame_count = 0;
+
+            ESP_LOGI(TAG, "开始编码 %zu 采样，帧大小: %zu", total_samples,
+                     frame_size);
 
             while (offset < audio_to_send.size()) {
               size_t remaining = audio_to_send.size() - offset;
@@ -680,12 +925,36 @@ static void send_accumulated_audio(void) {
                                      });
 
               offset += current_frame_size;
+              frame_count++;
             }
+
+            ESP_LOGI(TAG, "音频编码完成，共 %d 帧", frame_count);
+
+            // 再次检查连接状态
+            if (!g_running || g_state == CG_AI_STATE_IDLE) {
+              ESP_LOGW(TAG, "编码完成但连接已断开，不改变状态");
+              return;
+            }
+
+            // 发送停止监听消息，告诉服务器这段话说完了
+            websocket_send_stop_listening();
+
+            // 只有在 LISTENING 状态且仍在运行才切换到 SENDING
+            if (g_running && g_state == CG_AI_STATE_LISTENING) {
+              set_state(CG_AI_STATE_SENDING);
+            }
+          } else {
+            ESP_LOGE(TAG, "Opus 编码器为空，无法编码");
           }
+
+          ESP_LOGI(TAG, "音频编码发送完成");
         });
+  } else {
+    ESP_LOGE(TAG, "后台任务或编码器为空: bg_task=%p, encoder=%p",
+             g_background_task.get(), g_opus_encoder.get());
   }
 
-  ESP_LOGI(TAG, "累积音频已发送");
+  ESP_LOGI(TAG, "累积音频已提交发送队列，等待 TTS 响应");
 }
 
 // ============== 麦克风任务 ==============
@@ -745,7 +1014,7 @@ static void mic_task(void *pvParameters) {
   ESP_LOGI(TAG, "开始录音...");
 
   while (g_running) {
-    // 只在监听状态下录音
+    // 只在监听状态下录音（SENDING 和 SPEAKING 状态不录音）
     if (g_state != CG_AI_STATE_LISTENING) {
       vTaskDelay(pdMS_TO_TICKS(50));
       continue;
@@ -846,14 +1115,22 @@ static void mic_task(void *pvParameters) {
 static void audio_out_task(void *pvParameters) {
   ESP_LOGI(TAG, "音频输出任务启动");
 
+  int empty_count = 0;           // 队列为空的计数
+  bool has_played_audio = false; // 是否播放过音频
+
   while (g_running) {
     std::vector<uint8_t> opus_data;
+    bool queue_empty = false;
 
     {
       std::lock_guard<std::mutex> lock(g_audio_mutex);
       if (!g_audio_out_queue.empty()) {
         opus_data = std::move(g_audio_out_queue.front());
         g_audio_out_queue.pop_front();
+        empty_count = 0;
+        has_played_audio = true; // 标记已播放过音频
+      } else {
+        queue_empty = true;
       }
     }
 
@@ -874,6 +1151,24 @@ static void audio_out_task(void *pvParameters) {
       }
     } else {
       vTaskDelay(pdMS_TO_TICKS(10));
+
+      // 只有播放过音频后，队列持续为空才恢复监听
+      if (queue_empty && g_state == CG_AI_STATE_SPEAKING && has_played_audio) {
+        empty_count++;
+        // 队列为空超过 500ms（50 次 * 10ms），认为播放完成
+        if (empty_count > 50) {
+          ESP_LOGI(TAG, "TTS 播放完成，自动恢复监听");
+          set_state(CG_AI_STATE_LISTENING);
+          empty_count = 0;
+          has_played_audio = false; // 重置标志
+        }
+      }
+
+      // 状态不是 SPEAKING 时，重置标志
+      if (g_state != CG_AI_STATE_SPEAKING) {
+        has_played_audio = false;
+        empty_count = 0;
+      }
     }
   }
 
@@ -1036,8 +1331,8 @@ esp_err_t cg_ai_service_start(void) {
     return ESP_FAIL;
   }
 
-  // 启动音频输出任务（使用 PSRAM 分配栈）
-  xTaskCreatePinnedToCore(audio_out_task, "ai_audio_out", 8192, nullptr, 4,
+  // 启动音频输出任务（Opus 解码需要较大栈空间）
+  xTaskCreatePinnedToCore(audio_out_task, "ai_audio_out", 16384, nullptr, 4,
                           &g_audio_out_task_handle, 1);
 
   // 启动麦克风任务（使用 PSRAM，Opus 编码需要约 20KB+ 栈空间）

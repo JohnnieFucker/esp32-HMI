@@ -55,6 +55,9 @@ idf_component_register(
         "./services/note/note_service.c"
         "./services/note/audio_recorder.c"
         
+        # 网络监控
+        "./services/network/network_monitor.c"
+        
         # ============ UI 层 ============
         "./drivers/lvgl_port/lvgl_driver.c"
         ${UI_SRCS}
@@ -81,6 +84,7 @@ idf_component_register(
         "./services/http"
         "./services/ai"
         "./services/note"
+        "./services/network"
         
         # UI 层
         ${UI_DIR}

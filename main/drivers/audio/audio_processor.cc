@@ -92,16 +92,16 @@ void AudioProcessor::Input(const std::vector<int16_t> &data) {
   input_buffer_.insert(input_buffer_.end(), data.begin(), data.end());
 
   auto feed_size = afe_iface_->get_feed_chunksize(afe_data_) * channels_;
-  static int feed_count = 0;
+  //   static int feed_count = 0;
   while (input_buffer_.size() >= feed_size) {
     auto chunk = input_buffer_.data();
     afe_iface_->feed(afe_data_, chunk);
     input_buffer_.erase(input_buffer_.begin(),
                         input_buffer_.begin() + feed_size);
-    if (++feed_count % 50 == 1) {
-      ESP_LOGI(TAG, "已 feed %d 次数据到 AFE, feed_size=%d", feed_count,
-               feed_size);
-    }
+    // if (++feed_count % 50 == 1) {
+    //   ESP_LOGI(TAG, "已 feed %d 次数据到 AFE, feed_size=%d", feed_count,
+    //            feed_size);
+    // }
   }
 }
 
@@ -168,12 +168,13 @@ void AudioProcessor::AudioProcessorTask() {
       continue;
     }
 
-    // 每 50 次打印一次状态
-    static int fetch_count = 0;
-    if (++fetch_count % 50 == 1) {
-      ESP_LOGI(TAG, "fetch 成功 %d 次，vad_state=%d, data_size=%d", fetch_count,
-               res->vad_state, res->data_size);
-    }
+    // // 每 50 次打印一次状态
+    // static int fetch_count = 0;
+    // if (++fetch_count % 50 == 1) {
+    //   ESP_LOGI(TAG, "fetch 成功 %d 次，vad_state=%d, data_size=%d",
+    //   fetch_count,
+    //            res->vad_state, res->data_size);
+    // }
 
     // VAD state change
     if (vad_state_change_callback_) {

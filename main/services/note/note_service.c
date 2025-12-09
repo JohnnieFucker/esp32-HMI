@@ -5,6 +5,7 @@
 #include "audio_recorder.h"
 #include "http_client.h"
 #include "utils.h"
+#include "wifi_service.h"  // 添加 WiFi 状态检测
 #include "freertos/task.h"
 #include "freertos/queue.h"
 #include <string.h>
@@ -12,6 +13,13 @@
 #include <stdlib.h>
 
 static const char *TAG = "NoteService";
+
+// 上传配置
+#define UPLOAD_TIMEOUT_MS 30000       // 上传超时时间：30秒（原来是120秒）
+#define UPLOAD_MAX_RETRIES 3          // 上传最大重试次数
+#define UPLOAD_RETRY_DELAY_MS 2000    // 重试间隔：2秒
+#define WIFI_WAIT_TIMEOUT_MS 10000    // WiFi 等待超时：10秒
+#define QUEUE_WAIT_TIMEOUT_SEC 120    // 队列等待超时：2分钟
 
 // 录音配置（从 app_config.h 读取）
 #define RECORD_SAMPLE_RATE 16000
@@ -120,6 +128,17 @@ static void create_wav_header_in_memory(uint8_t *buffer, uint32_t data_size,
 // 上传任务运行标志（独立于录音任务）
 static bool g_upload_task_running = false;
 
+// 等待 WiFi 连接的辅助函数
+static bool wait_for_wifi(int timeout_ms) {
+    int waited = 0;
+    while (!WiFi_IsConnected() && waited < timeout_ms) {
+        ESP_LOGW(TAG, "等待 WiFi 连接... (%d/%d ms)", waited, timeout_ms);
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        waited += 1000;
+    }
+    return WiFi_IsConnected();
+}
+
 // 上传任务（异步上传，不阻塞录音）
 static void upload_task(void *pvParameters) {
     ESP_LOGI(TAG, "上传任务启动");
@@ -137,6 +156,18 @@ static void upload_task(void *pvParameters) {
             ESP_LOGI(TAG, "队列剩余: %d 个文件", uxQueueMessagesWaiting(g_upload_queue));
             ESP_LOGI(TAG, "==============================");
             
+            // 检查 WiFi 连接状态，如果断开则等待重连
+            if (!WiFi_IsConnected()) {
+                ESP_LOGW(TAG, "WiFi 未连接，等待重连...");
+                if (!wait_for_wifi(WIFI_WAIT_TIMEOUT_MS)) {
+                    ESP_LOGE(TAG, "WiFi 连接超时，丢弃文件: %s", item.filename);
+                    free(item.wav_buffer);
+                    ESP_LOGI(TAG, "已释放上传缓冲区，队列剩余: %d", uxQueueMessagesWaiting(g_upload_queue));
+                    continue;
+                }
+                ESP_LOGI(TAG, "WiFi 已重新连接，继续上传");
+            }
+            
             // 构建上传URL
             char url[512];
             snprintf(url, sizeof(url), "%s%s", CG_API_URL, API_UPLOAD);
@@ -145,21 +176,48 @@ static void upload_task(void *pvParameters) {
                 .url = url,
                 .method = "POST",
                 .token = CG_TOKEN,
-                .timeout_ms = 120000,
+                .timeout_ms = UPLOAD_TIMEOUT_MS,  // 使用新的超时时间
                 .ssl_verify_mode = HTTP_SSL_VERIFY_NONE,
             };
 
-            int status_code = 0;
-            char response_buffer[512] = {0};
-            esp_err_t ret = http_client_post_multipart_from_memory(
-                &upload_config, item.wav_buffer, item.wav_size,
-                item.filename, "file", "fileName",
-                &status_code, response_buffer, sizeof(response_buffer));
+            // 添加重试机制
+            int retry_count = 0;
+            bool upload_success = false;
             
-            if (ret == ESP_OK && status_code == 200) {
-                ESP_LOGI(TAG, "上传成功: %s", item.filename);
-            } else {
-                ESP_LOGW(TAG, "上传失败: %s, 状态码: %d", item.filename, status_code);
+            while (retry_count < UPLOAD_MAX_RETRIES && !upload_success) {
+                if (retry_count > 0) {
+                    ESP_LOGW(TAG, "第 %d 次重试上传: %s", retry_count, item.filename);
+                    vTaskDelay(pdMS_TO_TICKS(UPLOAD_RETRY_DELAY_MS));
+                    
+                    // 重试前再次检查 WiFi 状态
+                    if (!WiFi_IsConnected()) {
+                        ESP_LOGW(TAG, "WiFi 断开，等待重连...");
+                        if (!wait_for_wifi(WIFI_WAIT_TIMEOUT_MS)) {
+                            ESP_LOGE(TAG, "WiFi 连接超时，停止重试");
+                            break;
+                        }
+                    }
+                }
+                
+                int status_code = 0;
+                char response_buffer[512] = {0};
+                esp_err_t ret = http_client_post_multipart_from_memory(
+                    &upload_config, item.wav_buffer, item.wav_size,
+                    item.filename, "file", "fileName",
+                    &status_code, response_buffer, sizeof(response_buffer));
+                
+                if (ret == ESP_OK && status_code == 200) {
+                    ESP_LOGI(TAG, "上传成功: %s", item.filename);
+                    upload_success = true;
+                } else {
+                    ESP_LOGW(TAG, "上传失败: %s, 状态码: %d, 错误: %s", 
+                             item.filename, status_code, esp_err_to_name(ret));
+                    retry_count++;
+                }
+            }
+            
+            if (!upload_success) {
+                ESP_LOGE(TAG, "上传最终失败（重试 %d 次）: %s", retry_count, item.filename);
             }
             
             // 释放缓冲区
@@ -183,6 +241,9 @@ static void record_task(void *pvParameters) {
     const size_t audio_data_size = samples_to_record * bytes_per_sample;
     const size_t total_buffer_size = wav_header_size + audio_data_size;
 
+    // 队列等待计时器
+    uint32_t queue_wait_start = 0;
+    
     while (g_record_task_running) {
         
         // 检查可用内存
@@ -191,12 +252,40 @@ static void record_task(void *pvParameters) {
                  free_spiram / 1024, total_buffer_size / 1024,
                  uxQueueMessagesWaiting(g_upload_queue), UPLOAD_QUEUE_SIZE);
         
-        // 如果上传队列已满，等待队列有空位
+        // 如果上传队列已满，等待队列有空位（添加超时机制）
         if (uxQueueMessagesWaiting(g_upload_queue) >= UPLOAD_QUEUE_SIZE) {
-            ESP_LOGW(TAG, "上传队列已满，等待上传完成...");
+            // 初始化等待计时
+            if (queue_wait_start == 0) {
+                queue_wait_start = xTaskGetTickCount() * portTICK_PERIOD_MS / 1000;
+            }
+            
+            uint32_t now_sec = xTaskGetTickCount() * portTICK_PERIOD_MS / 1000;
+            uint32_t waited_sec = now_sec - queue_wait_start;
+            
+            // 检查是否超时
+            if (waited_sec >= QUEUE_WAIT_TIMEOUT_SEC) {
+                ESP_LOGE(TAG, "等待上传队列超时 (%lu 秒)，检查网络状态...", (unsigned long)waited_sec);
+                
+                // 检查 WiFi 状态
+                if (!WiFi_IsConnected()) {
+                    ESP_LOGE(TAG, "WiFi 已断开！停止录音任务。");
+                    // 不再继续等待，让上传任务处理失败情况
+                    g_record_task_running = false;
+                    break;
+                }
+                
+                // WiFi 正常但上传仍然卡住，重置等待计时器继续等待
+                ESP_LOGW(TAG, "WiFi 正常，继续等待上传完成...");
+                queue_wait_start = now_sec;
+            }
+            
+            ESP_LOGW(TAG, "上传队列已满，等待上传完成... (已等待 %lu 秒)", (unsigned long)waited_sec);
             vTaskDelay(pdMS_TO_TICKS(1000));
             continue;
         }
+        
+        // 队列有空位，重置等待计时器
+        queue_wait_start = 0;
         
         // 分配内存（优先PSRAM）
         uint8_t *wav_buffer = NULL;
@@ -484,6 +573,19 @@ static void generate_note_task(void *pvParameters) {
     
     ESP_LOGI(TAG, "生成笔记任务启动，UUID: %s", params->note_id);
     
+    // 检查 WiFi 连接状态
+    if (!WiFi_IsConnected()) {
+        ESP_LOGW(TAG, "WiFi 未连接，等待重连...");
+        if (!wait_for_wifi(WIFI_WAIT_TIMEOUT_MS)) {
+            ESP_LOGE(TAG, "WiFi 连接超时，生成笔记失败");
+            free(params);
+            ESP_LOGI(TAG, "生成笔记任务结束（网络错误）");
+            vTaskDelete(NULL);
+            return;
+        }
+        ESP_LOGI(TAG, "WiFi 已重新连接，继续生成笔记");
+    }
+    
     // 使用动态分配减少栈压力
     char *url = (char *)malloc(256);
     char *json_body = (char *)malloc(256);
@@ -507,18 +609,44 @@ static void generate_note_task(void *pvParameters) {
         .token = CG_TOKEN,
         .body = json_body,
         .body_len = strlen(json_body),
-        .timeout_ms = 60000,
+        .timeout_ms = 30000,  // 减少超时时间到 30 秒
         .ssl_verify_mode = HTTP_SSL_VERIFY_NONE,
     };
 
-    int status_code = 0;
-    response_buffer[0] = '\0';
-    esp_err_t err = http_client_post_json(&config, &status_code, response_buffer, 256);
+    // 添加重试机制
+    int retry_count = 0;
+    bool success = false;
     
-    if (err == ESP_OK && status_code == 200) {
-        ESP_LOGI(TAG, "生成笔记成功");
-    } else {
-        ESP_LOGW(TAG, "生成笔记失败，状态码: %d", status_code);
+    while (retry_count < UPLOAD_MAX_RETRIES && !success) {
+        if (retry_count > 0) {
+            ESP_LOGW(TAG, "第 %d 次重试生成笔记", retry_count);
+            vTaskDelay(pdMS_TO_TICKS(UPLOAD_RETRY_DELAY_MS));
+            
+            // 重试前检查 WiFi
+            if (!WiFi_IsConnected()) {
+                ESP_LOGW(TAG, "WiFi 断开，等待重连...");
+                if (!wait_for_wifi(WIFI_WAIT_TIMEOUT_MS)) {
+                    ESP_LOGE(TAG, "WiFi 连接超时，停止重试");
+                    break;
+                }
+            }
+        }
+        
+        int status_code = 0;
+        response_buffer[0] = '\0';
+        esp_err_t err = http_client_post_json(&config, &status_code, response_buffer, 256);
+        
+        if (err == ESP_OK && status_code == 200) {
+            ESP_LOGI(TAG, "生成笔记成功");
+            success = true;
+        } else {
+            ESP_LOGW(TAG, "生成笔记失败，状态码: %d, 错误: %s", status_code, esp_err_to_name(err));
+            retry_count++;
+        }
+    }
+    
+    if (!success) {
+        ESP_LOGE(TAG, "生成笔记最终失败（重试 %d 次）", retry_count);
     }
 
 cleanup:

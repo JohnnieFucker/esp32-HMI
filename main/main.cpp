@@ -7,12 +7,14 @@
  * 2. 初始化显示系统（LCD、背光、触摸）
  * 3. 初始化音频系统（I2S、音频播放器）
  * 4. 初始化 LVGL 图形库和 UI
- * 5. 进入主循环处理 UI 事件
+ * 5. 启动网络监控服务
+ * 6. 进入主循环处理 UI 事件
  */
 
 #include "bat_driver.h"
 #include "lvgl.h"
 #include "lvgl_driver.h"
+#include "network_monitor.h"
 #include "pcf85063.h"
 #include "pcm5101.h"
 #include "st77916.h"
@@ -109,7 +111,10 @@ extern "C" void app_main(void) {
   LVGL_Init();
   ui_init();
 
-  // 阶段5：主循环
+  // 阶段5：启动网络监控服务（检测网络断开并播放提示音）
+  network_monitor_start();
+
+  // 阶段6：主循环
   while (1) {
     ui_tick();
     vTaskDelay(pdMS_TO_TICKS(5)); // 减少 SPI 队列压力

@@ -617,6 +617,10 @@ static void websocket_event_handler(void *handler_args, esp_event_base_t base,
           }
           std::lock_guard<std::mutex> lock(g_audio_mutex);
           g_audio_out_queue.push_back(std::move(g_ws_binary_buffer));
+          //   ESP_LOGI(TAG, "TTS 音频已加入播放队列，队列大小: %zu",
+          //            g_audio_out_queue.size());
+        } else {
+          ESP_LOGW(TAG, "收到 TTS 音频但状态不正确 (state=%d)，丢弃", g_state);
         }
         g_ws_binary_buffer.clear();
       }
@@ -811,10 +815,11 @@ static void websocket_send_audio(const std::vector<uint8_t> &opus_data) {
     return;
   }
 
-  static int send_count = 0;
-  send_count++;
+  //   static int send_count = 0;
+  //   send_count++;
 
-  ESP_LOGI(TAG, ">>> 发送 Opus 帧 #%d: %zu 字节", send_count, opus_data.size());
+  //   ESP_LOGI(TAG, ">>> 发送 Opus 帧 #%d: %zu 字节", send_count,
+  //   opus_data.size());
 
   int ret =
       esp_websocket_client_send_bin(g_ws_client, (const char *)opus_data.data(),
@@ -822,7 +827,7 @@ static void websocket_send_audio(const std::vector<uint8_t> &opus_data) {
   if (ret < 0) {
     ESP_LOGE(TAG, "!!! 发送失败，返回值: %d", ret);
   } else {
-    ESP_LOGI(TAG, "<<< 发送成功，返回值: %d 字节", ret);
+    // ESP_LOGI(TAG, "<<< 发送成功，返回值: %d 字节", ret);
   }
 }
 
@@ -1026,14 +1031,14 @@ static void mic_task(void *pvParameters) {
         MIC_Read(pcm_buffer.data(), MIC_READ_SAMPLES, &bytes_read, 1000);
 
     // 每秒打印一次读取状态（约每50次）
-    static int read_count = 0;
-    if (++read_count % 50 == 1) {
-      ESP_LOGI(
-          TAG,
-          "MIC_Read: ret=%d, bytes_read=%d, state=%d, processor=%p, running=%d",
-          ret, bytes_read, g_state, g_audio_processor.get(),
-          g_audio_processor ? g_audio_processor->IsRunning() : 0);
-    }
+    // static int read_count = 0;
+    // if (++read_count % 50 == 1) {
+    //   ESP_LOGI(
+    //       TAG,
+    //       "MIC_Read: ret=%d, bytes_read=%d, state=%d, processor=%p,
+    //       running=%d", ret, bytes_read, g_state, g_audio_processor.get(),
+    //       g_audio_processor ? g_audio_processor->IsRunning() : 0);
+    // }
 
     if (ret == ESP_OK && bytes_read > 0) {
       // 再次检查状态，避免在 MIC_Read 阻塞期间状态变化
@@ -1048,20 +1053,20 @@ static void mic_task(void *pvParameters) {
                                     pcm_buffer.begin() + samples_read);
 
       // 使用音频处理器进行 VAD 检测和音频处理
-      static int input_count = 0;
+      //   static int input_count = 0;
       if (g_audio_processor && g_audio_processor->IsRunning()) {
         g_audio_processor->Input(pcm_data);
-        if (++input_count % 50 == 1) {
-          ESP_LOGI(TAG, "已输入 %d 次音频到 AudioProcessor, samples=%d",
-                   input_count, samples_read);
-        }
+        // if (++input_count % 50 == 1) {
+        //   ESP_LOGI(TAG, "已输入 %d 次音频到 AudioProcessor, samples=%d",
+        //            input_count, samples_read);
+        // }
       } else {
         // 回退：如果没有音频处理器，直接编码发送
-        static int fallback_count = 0;
-        if (++fallback_count % 50 == 1) {
-          ESP_LOGI(TAG, "直接发送音频 #%d, samples=%d", fallback_count,
-                   samples_read);
-        }
+        // static int fallback_count = 0;
+        // if (++fallback_count % 50 == 1) {
+        //   ESP_LOGI(TAG, "直接发送音频 #%d, samples=%d", fallback_count,
+        //            samples_read);
+        // }
         if (g_background_task) {
           g_background_task->Schedule(
               [pcm_data = std::move(pcm_data)]() mutable {
@@ -1129,6 +1134,11 @@ static void audio_out_task(void *pvParameters) {
         g_audio_out_queue.pop_front();
         empty_count = 0;
         has_played_audio = true; // 标记已播放过音频
+        // static int queue_pop_count = 0;
+        // if (++queue_pop_count % 20 == 1) {
+        //   ESP_LOGI(TAG, "从队列取出音频 #%d，剩余队列大小: %zu",
+        //            queue_pop_count, g_audio_out_queue.size());
+        // }
       } else {
         queue_empty = true;
       }
@@ -1139,13 +1149,16 @@ static void audio_out_task(void *pvParameters) {
       std::vector<int16_t> pcm;
       if (g_opus_decoder->Decode(std::move(opus_data), pcm)) {
         // 打印解码结果（调试用，每 10 帧打印一次）
-        static int decode_count = 0;
-        if (++decode_count % 10 == 1) {
-          ESP_LOGI(TAG, "解码成功 #%d, PCM samples=%zu", decode_count,
-                   pcm.size());
-        }
+        // static int decode_count = 0;
+        // if (++decode_count % 10 == 1) {
+        //   ESP_LOGI(TAG, "解码成功 #%d, PCM samples=%zu", decode_count,
+        //            pcm.size());
+        // }
         // 播放音频（使用足够长的超时确保写入完成）
-        Audio_I2S_Write(pcm.data(), pcm.size(), 1000);
+        esp_err_t write_ret = Audio_I2S_Write(pcm.data(), pcm.size(), 1000);
+        if (write_ret != ESP_OK) {
+          ESP_LOGE(TAG, "音频写入失败: %s", esp_err_to_name(write_ret));
+        }
       } else {
         ESP_LOGW(TAG, "Opus 解码失败，数据大小=%zu", opus_data.size());
       }
